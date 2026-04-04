@@ -13,6 +13,7 @@
   "type": "module",
   "main": "dist/index.js",
   "bin": {
+    "flashedge": "dist/index.js",
     "flash": "dist/index.js"
   },
   "exports": {

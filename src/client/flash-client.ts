@@ -1855,6 +1855,75 @@ export class FlashClient implements IFlashClient {
     }
   }
 
+  // ─── Reverse Position ──────────────────────────────────────────────────────
+
+  async reversePosition(market: string, side: TradeSide): Promise<{ txSignature: string; newSide: string; newEntryPrice: number; newLeverage: number; newSizeUsd: number }> {
+    this.acquireTradeLock(market, side);
+    try {
+      // Get position pubkey from API
+      const positions = await this.getPositions();
+      const pos = positions.find((p) => p.market?.toUpperCase() === market.toUpperCase() && p.side === side);
+      if (!pos || !pos.pubkey) {
+        const sideStr = side === TradeSide.Long ? 'long' : 'short';
+        throw new Error(`No open ${sideStr} position on ${market} to reverse`);
+      }
+
+      await checkApiHealth();
+      checkCircuitBreaker();
+
+      const startMs = Date.now();
+      const owner = this.wallet.publicKey.toBase58();
+      const ref = this.getReferralParams();
+
+      const apiResponse = await getFlashApiClient().reversePosition({
+        owner,
+        positionKey: pos.pubkey,
+        slippagePercentage: (this.config.defaultSlippageBps / 100).toString(),
+        privilege: ref ? 'REFERRAL' : 'NONE',
+        userReferralAccount: ref?.userReferralAccount.toBase58(),
+        tokenStakeFafAccount: ref?.tokenStakeAccount.toBase58(),
+      });
+
+      if (!apiResponse) {
+        throw new ExecutionError('Flash API unavailable. Check network connectivity and try again.', {
+          action: 'closePosition', errorCode: 'API_UNREACHABLE',
+        });
+      }
+      if (apiResponse.err) {
+        throw new ExecutionError(`Reverse rejected: ${apiResponse.err}`, {
+          action: 'closePosition', errorCode: 'API_ERROR', apiError: String(apiResponse.err),
+        });
+      }
+      if (!apiResponse.transactionBase64) {
+        throw new ExecutionError('Flash API returned empty transaction. Try again.', {
+          action: 'closePosition', errorCode: 'TX_BUILD_FAILED',
+        });
+      }
+
+      const validated = this.validateTransactionBeforeSign(apiResponse.transactionBase64, 'closePosition');
+      const txSignature = await this.sendApiTransaction(apiResponse.transactionBase64, validated);
+
+      const cb = getExecutionCircuitBreaker();
+      cb.recordSuccess(Date.now() - startMs);
+
+      const logger = getLogger();
+      logger.trade('REVERSE', {
+        market, fromSide: side, newSide: apiResponse.newSide,
+        pnl: apiResponse.closeSettledPnl, tx: txSignature,
+      });
+
+      return {
+        txSignature,
+        newSide: String(apiResponse.newSide ?? ''),
+        newEntryPrice: parseFloat(String(apiResponse.newEntryPrice)) || 0,
+        newLeverage: parseFloat(String(apiResponse.newLeverage)) || 0,
+        newSizeUsd: parseFloat(String(apiResponse.newSizeUsd)) || 0,
+      };
+    } finally {
+      this.releaseTradeLock(market, side);
+    }
+  }
+
   // ─── API-Based Position Fetching ──────────────────────────────────────────
   // Fetches enriched position data from Flash API (includes PnL, leverage, liquidation).
   // Used for faster position queries when API is available.
@@ -1866,17 +1935,35 @@ export class FlashClient implements IFlashClient {
       const apiPositions = await getFlashApiClient().getPositionsByOwner(owner);
       if (!apiPositions || apiPositions.length === 0) return apiPositions ? [] : null;
 
+      // Fetch current prices to compute mark price (API positions don't include it)
+      const priceService = new (await import('../data/prices.js')).PriceService();
+      const symbols = apiPositions.map((ap) => String(ap.marketSymbol ?? '')).filter(Boolean);
+      const priceMap = symbols.length > 0 ? await priceService.getPrices(symbols) : new Map();
+
       const positions: Position[] = [];
       for (const ap of apiPositions) {
         // Parse enriched position fields (API returns *Ui string fields)
-        const sizeUsd = parseFloat(String(ap.sizeUsdUi ?? ap.sizeUsd ?? 0));
-        const collateralUsd = parseFloat(String(ap.collateralUsdUi ?? ap.collateralUsd ?? 0));
-        const entryPrice = parseFloat(String(ap.entryPriceUi ?? ap.entryPrice ?? 0));
-        const markPrice = parseFloat(String(ap.markPriceUi ?? ap.markPrice ?? 0));
-        const leverage = parseFloat(String(ap.leverageUi ?? ap.leverage ?? 0));
-        const liquidationPrice = parseFloat(String(ap.liquidationPriceUi ?? ap.liquidationPrice ?? 0));
-        const pnl = parseFloat(String(ap.pnl ?? 0));
-        const sideStr = String(ap.sideUi ?? ap.side ?? '').toLowerCase();
+        const sizeUsd = parseFloat(String(ap.sizeUsdUi ?? 0));
+        const collateralUsd = parseFloat(String(ap.collateralUsdUi ?? 0));
+        const entryPrice = parseFloat(String(ap.entryPriceUi ?? 0));
+        const leverage = parseFloat(String(ap.leverageUi ?? 0));
+        const liquidationPrice = parseFloat(String(ap.liquidationPriceUi ?? 0));
+        const sideStr = String(ap.sideUi ?? '').toLowerCase();
+        const marketSymbol = String(ap.marketSymbol ?? '');
+
+        // PnL: API returns pnlWithFeeUsdUi (string) and pnlPercentageWithFee (string)
+        const pnl = parseFloat(String(ap.pnlWithFeeUsdUi ?? 0));
+        const pnlPercent = parseFloat(String(ap.pnlPercentageWithFee ?? 0));
+
+        // Mark price: fetch from live price feed (API doesn't return it)
+        const livePriceData = priceMap.get(marketSymbol.toUpperCase());
+        const markPrice = livePriceData?.price ?? 0;
+
+        // Fees from PnL object
+        const pnlObj = (typeof ap.pnl === 'object' && ap.pnl !== null ? ap.pnl : undefined) as Record<string, unknown> | undefined;
+        const exitFeeUsd = pnlObj ? parseFloat(String(pnlObj.exitFeeUsd ?? 0)) / 1e6 : 0;
+        const borrowFeeUsd = pnlObj ? parseFloat(String(pnlObj.borrowFeeUsd ?? 0)) / 1e6 : 0;
+        const totalFees = exitFeeUsd + borrowFeeUsd;
 
         if (!Number.isFinite(sizeUsd) || sizeUsd <= 0) continue;
         if (!Number.isFinite(entryPrice) || entryPrice <= 0) continue;
@@ -1887,19 +1974,19 @@ export class FlashClient implements IFlashClient {
 
         positions.push({
           pubkey: String(ap.key ?? ''),
-          market: String(ap.marketSymbol ?? ''),
+          market: marketSymbol,
           side: sideStr === 'long' ? TradeSide.Long : TradeSide.Short,
           sizeUsd,
           collateralUsd,
           entryPrice,
           currentPrice: markPrice > 0 ? markPrice : entryPrice,
-          markPrice,
+          markPrice: markPrice > 0 ? markPrice : entryPrice,
           leverage: effectiveLeverage,
           liquidationPrice: Number.isFinite(liquidationPrice) ? liquidationPrice : 0,
           unrealizedPnl: Number.isFinite(pnl) ? pnl : 0,
-          unrealizedPnlPercent: collateralUsd > 0 && Number.isFinite(pnl) ? (pnl / collateralUsd) * 100 : 0,
-          openFee: 0,
-          totalFees: 0,
+          unrealizedPnlPercent: Number.isFinite(pnlPercent) ? pnlPercent : 0,
+          openFee: Number.isFinite(exitFeeUsd) ? exitFeeUsd : 0,
+          totalFees: Number.isFinite(totalFees) ? totalFees : 0,
           fundingRate: 0,
           timestamp: Date.now(),
         });
@@ -2002,9 +2089,14 @@ export class FlashClient implements IFlashClient {
   async addCollateral(market: string, side: TradeSide, amount: number): Promise<CollateralResult> {
     this.acquireTradeLock(market, side);
     try {
-      const poolConfig = this.getPoolConfigForMarket(market);
-      const { position } = await this.findUserPosition(poolConfig, market, side);
-      return await this.executeAddCollateral(position.pubkey.toBase58(), amount);
+      // Get position pubkey from API (not SDK — avoids on-chain lookup failures)
+      const positions = await this.getPositions();
+      const pos = positions.find((p) => p.market?.toUpperCase() === market.toUpperCase() && p.side === side);
+      if (!pos || !pos.pubkey) {
+        const sideStr = side === TradeSide.Long ? 'long' : 'short';
+        throw new Error(`No open ${sideStr} position on ${market}`);
+      }
+      return await this.executeAddCollateral(pos.pubkey, amount);
     } finally {
       this.releaseTradeLock(market, side);
     }
@@ -2013,9 +2105,14 @@ export class FlashClient implements IFlashClient {
   async removeCollateral(market: string, side: TradeSide, amount: number): Promise<CollateralResult> {
     this.acquireTradeLock(market, side);
     try {
-      const poolConfig = this.getPoolConfigForMarket(market);
-      const { position } = await this.findUserPosition(poolConfig, market, side);
-      return await this.executeRemoveCollateral(position.pubkey.toBase58(), amount);
+      // Get position pubkey from API (not SDK — avoids on-chain lookup failures)
+      const positions = await this.getPositions();
+      const pos = positions.find((p) => p.market?.toUpperCase() === market.toUpperCase() && p.side === side);
+      if (!pos || !pos.pubkey) {
+        const sideStr = side === TradeSide.Long ? 'long' : 'short';
+        throw new Error(`No open ${sideStr} position on ${market}`);
+      }
+      return await this.executeRemoveCollateral(pos.pubkey, amount);
     } finally {
       this.releaseTradeLock(market, side);
     }
@@ -3051,76 +3148,89 @@ export class FlashClient implements IFlashClient {
     const logger = getLogger();
     const result: OnChainOrder[] = [];
 
-    // Iterate all pools to find orders
-    for (const poolName of POOL_NAMES) {
-      if (!isTradeablePool(poolName)) continue;
-      try {
-        const pc = PoolConfig.fromIdsByName(poolName, this.config.network);
-        const orderAccounts = await this.perpClient.getUserOrderAccounts(this.wallet.publicKey, pc);
+    // Use Flash API to fetch orders (avoids SDK getMultipleAccounts limits on free-tier RPCs)
+    try {
+      const owner = this.wallet.publicKey.toBase58();
+      const apiOrders = await getFlashApiClient().getOrdersByOwner(owner);
+      if (!apiOrders || !Array.isArray(apiOrders)) return result;
 
-        for (const oa of orderAccounts) {
-          if (!oa.isActive) continue;
+      for (const oa of apiOrders) {
+        // Limit orders
+        const limitOrders = (oa as Record<string, unknown>).limitOrders as Array<Record<string, unknown>> | undefined;
+        if (Array.isArray(limitOrders)) {
+          for (const lo of limitOrders) {
+            const symbol = String(lo.symbol ?? '');
+            const sideStr = String(lo.sideUi ?? '').toLowerCase();
+            const reserveUsd = parseFloat(String(lo.reserveAmountUsdUi ?? 0));
+            if (!symbol || reserveUsd <= 0) continue;
 
-          // Resolve market symbol from the market account
-          const poolMarkets = getTypedMarkets(pc);
-          const matchedMarket = poolMarkets.find((m) => m.marketAccount.equals(oa.market));
-          if (!matchedMarket) continue;
-
-          const tokens = pc.tokens as Array<{ symbol: string; mintKey: PublicKey }>;
-          const targetToken = tokens.find((t) => t.mintKey.equals(matchedMarket.targetMint));
-          if (!targetToken) continue;
-
-          const marketSymbol = targetToken.symbol;
-          const sideVal = matchedMarket.side === Side.Long ? TradeSide.Long : TradeSide.Short;
-
-          // Limit orders
-          for (let i = 0; i < oa.limitOrders.length; i++) {
-            const lo = oa.limitOrders[i];
-            if (lo.reserveAmount.isZero() && lo.sizeAmount.isZero()) continue;
-            const price = this.contractPriceToUi(lo.limitPrice);
+            // Extract price from entryOraclePrice
+            const oraclePrice = lo.entryOraclePrice as Record<string, unknown> | undefined;
+            const rawPrice = parseFloat(String(oraclePrice?.price ?? 0));
+            const exponent = parseFloat(String(oraclePrice?.exponent ?? 0));
+            const price = rawPrice * Math.pow(10, exponent);
             if (price <= 0) continue;
+
             result.push({
-              market: marketSymbol,
-              side: sideVal,
+              market: symbol,
+              side: sideStr === 'long' ? TradeSide.Long : TradeSide.Short,
               type: 'limit',
-              orderId: i,
-              price,
-            });
-          }
-
-          // Take profit orders
-          for (let i = 0; i < oa.takeProfitOrders.length; i++) {
-            const tp = oa.takeProfitOrders[i];
-            if (tp.triggerSize.isZero()) continue;
-            const price = this.contractPriceToUi(tp.triggerPrice);
-            if (price <= 0) continue;
-            result.push({
-              market: marketSymbol,
-              side: sideVal,
-              type: 'take_profit',
-              orderId: i,
-              price,
-            });
-          }
-
-          // Stop loss orders
-          for (let i = 0; i < oa.stopLossOrders.length; i++) {
-            const sl = oa.stopLossOrders[i];
-            if (sl.triggerSize.isZero()) continue;
-            const price = this.contractPriceToUi(sl.triggerPrice);
-            if (price <= 0) continue;
-            result.push({
-              market: marketSymbol,
-              side: sideVal,
-              type: 'stop_loss',
-              orderId: i,
+              orderId: Number(lo.orderId ?? 0),
               price,
             });
           }
         }
-      } catch (err: unknown) {
-        logger.debug('CLIENT', `Order fetch for pool ${poolName} failed: ${getErrorMessage(err)}`);
+
+        // Take profit orders
+        const tpOrders = (oa as Record<string, unknown>).takeProfitOrders as Array<Record<string, unknown>> | undefined;
+        if (Array.isArray(tpOrders)) {
+          for (const tp of tpOrders) {
+            const triggerSize = parseFloat(String(tp.triggerSizeUi ?? 0));
+            if (triggerSize <= 0) continue;
+            const symbol = String(tp.symbol ?? '');
+            const sideStr = String(tp.sideUi ?? '').toLowerCase();
+            const oraclePrice = tp.triggerOraclePrice as Record<string, unknown> | undefined;
+            const rawPrice = parseFloat(String(oraclePrice?.price ?? 0));
+            const exponent = parseFloat(String(oraclePrice?.exponent ?? 0));
+            const price = rawPrice * Math.pow(10, exponent);
+            if (price <= 0) continue;
+
+            result.push({
+              market: symbol,
+              side: sideStr === 'long' ? TradeSide.Long : TradeSide.Short,
+              type: 'take_profit',
+              orderId: Number(tp.orderId ?? 0),
+              price,
+            });
+          }
+        }
+
+        // Stop loss orders
+        const slOrders = (oa as Record<string, unknown>).stopLossOrders as Array<Record<string, unknown>> | undefined;
+        if (Array.isArray(slOrders)) {
+          for (const sl of slOrders) {
+            const triggerSize = parseFloat(String(sl.triggerSizeUi ?? 0));
+            if (triggerSize <= 0) continue;
+            const symbol = String(sl.symbol ?? '');
+            const sideStr = String(sl.sideUi ?? '').toLowerCase();
+            const oraclePrice = sl.triggerOraclePrice as Record<string, unknown> | undefined;
+            const rawPrice = parseFloat(String(oraclePrice?.price ?? 0));
+            const exponent = parseFloat(String(oraclePrice?.exponent ?? 0));
+            const price = rawPrice * Math.pow(10, exponent);
+            if (price <= 0) continue;
+
+            result.push({
+              market: symbol,
+              side: sideStr === 'long' ? TradeSide.Long : TradeSide.Short,
+              type: 'stop_loss',
+              orderId: Number(sl.orderId ?? 0),
+              price,
+            });
+          }
+        }
       }
+    } catch (err: unknown) {
+      logger.debug('CLIENT', `API order fetch failed: ${getErrorMessage(err)}`);
     }
 
     return result;

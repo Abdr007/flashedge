@@ -1030,6 +1030,17 @@ export function localParse(input: string): ParsedIntent | null {
     return { action: ActionType.PortfolioRebalance };
   }
 
+  // ─── Reverse Position ───────────────────────────────────────────────────
+  // "reverse SOL", "reverse SOL long", "flip SOL long", "reverse position SOL"
+  {
+    const reverseMatch = lower.match(/^(?:reverse|flip)\s+(?:position\s+)?([a-z]+)(?:\s+(long|short))?$/);
+    if (reverseMatch) {
+      const market = reverseMatch[1].toUpperCase();
+      const side = reverseMatch[2] ?? 'long'; // default to long if not specified
+      return { action: ActionType.ReversePosition, market, side };
+    }
+  }
+
   // ─── Close All ─────────────────────────────────────────────────────────
 
   if (/^(?:close\s+all|close-all|closeall|exit\s+all)(?:\s+positions?)?$/.test(lower)) {

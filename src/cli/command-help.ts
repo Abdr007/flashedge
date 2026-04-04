@@ -15,6 +15,7 @@ const COMMAND_EXAMPLES: Record<string, string[]> = {
   open: ['open 5x long SOL $500', 'long sol 2x 10', 'short eth 3x 20'],
   close: ['close SOL long', 'close sol', 'close all'],
   'close all': ['close all'],
+  reverse: ['reverse SOL long', 'reverse BTC short', 'flip SOL long'],
   positions: ['positions'],
   portfolio: ['portfolio', 'balance'],
   markets: ['markets'],

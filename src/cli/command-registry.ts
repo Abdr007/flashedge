@@ -371,6 +371,13 @@ export const COMMAND_REGISTRY: CommandEntry[] = [
     aliases: ['order list', 'limit orders'],
   },
   {
+    name: 'reverse',
+    action: ActionType.ReversePosition,
+    category: 'Trading',
+    description: 'Reverse a position (close + open opposite side)',
+    aliases: ['reverse position', 'flip'],
+  },
+  {
     name: 'dryrun',
     action: null,
     category: 'Utilities',

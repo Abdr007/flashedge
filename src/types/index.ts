@@ -100,6 +100,9 @@ export enum ActionType {
   ListOrders = 'list_orders',
   EditLimitOrder = 'edit_limit_order',
 
+  // Reverse Position
+  ReversePosition = 'reverse_position',
+
   // Close All
   CloseAll = 'close_all',
 
@@ -452,7 +455,13 @@ export const EditLimitOrderSchema = z.object({
   limitPrice: z.number().positive().optional(),
 });
 
-// ─── Close All / Swap / Earn Schemas ────────────────────────────────────────
+// ─── Reverse Position / Close All / Swap / Earn Schemas ─────────────────────
+
+export const ReversePositionSchema = z.object({
+  action: z.literal(ActionType.ReversePosition),
+  market: z.string().max(20),
+  side: z.string().max(10),
+});
 
 export const CloseAllSchema = z.object({
   action: z.literal(ActionType.CloseAll),
@@ -605,6 +614,7 @@ export const ParsedIntentSchema = z.discriminatedUnion('action', [
   CancelOrderSchema,
   ListOrdersSchema,
   EditLimitOrderSchema,
+  ReversePositionSchema,
   CloseAllSchema,
   SwapSchema,
   EarnAddLiquiditySchema,
@@ -930,6 +940,9 @@ export interface IFlashClient {
   addCollateral(market: string, side: TradeSide, amount: number): Promise<CollateralResult>;
 
   removeCollateral(market: string, side: TradeSide, amount: number): Promise<CollateralResult>;
+
+  /** Reverse a position (close + open opposite side in one atomic transaction). */
+  reversePosition?(market: string, side: TradeSide): Promise<{ txSignature: string; newSide: string; newEntryPrice: number; newLeverage: number; newSizeUsd: number }>;
 
   getPositions(): Promise<Position[]>;
   getMarketData(market?: string): Promise<MarketData[]>;

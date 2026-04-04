@@ -162,20 +162,27 @@ export class PriceService {
     try {
       const client = getFlashApiClient();
       const allPrices = await client.getAllPrices();
-      if (!allPrices || !Array.isArray(allPrices)) {
+      if (!allPrices || typeof allPrices !== 'object') {
         cb.recordFailure();
         return [];
       }
 
+      // API returns object keyed by symbol: { SOL: {price, exponent, priceUi, ...}, BTC: {...} }
       const symbolSet = new Set(symbols.map((s) => s.toUpperCase()));
       const results: TokenPrice[] = [];
       const now = Date.now();
 
-      for (const apiPrice of allPrices) {
-        const sym = (apiPrice.symbol ?? '').toUpperCase();
+      const entries = Array.isArray(allPrices)
+        ? allPrices.map((p: Record<string, unknown>) => [String(p.symbol ?? ''), p] as const)
+        : Object.entries(allPrices);
+
+      for (const [key, apiPrice] of entries) {
+        const sym = key.toUpperCase();
         if (!symbolSet.has(sym)) continue;
 
-        const price = apiPrice.price_ui ?? apiPrice.price * Math.pow(10, apiPrice.exponent ?? 0);
+        const priceData = apiPrice as Record<string, unknown>;
+        const price = Number(priceData.priceUi ?? 0) ||
+          (Number(priceData.price ?? 0) * Math.pow(10, Number(priceData.exponent ?? 0)));
         if (!Number.isFinite(price) || price <= 0) continue;
 
         // Price deviation check against cache
@@ -198,7 +205,7 @@ export class PriceService {
           price,
           priceChange24h,
           timestamp: now,
-          isFallback: true, // Mark as fallback source
+          isFallback: false,
         });
       }
 

@@ -325,6 +325,13 @@ export class ToolEngine {
           params: { orderId: intent.orderId, market: intent.market, side: intent.side, limitPrice: intent.limitPrice },
         };
 
+      // ── Reverse Position ──
+      case ActionType.ReversePosition:
+        return {
+          toolName: 'flash_reverse_position',
+          params: { market: intent.market, side: intent.side },
+        };
+
       // ── Close All ──
       case ActionType.CloseAll:
         return { toolName: 'flash_close_all', params: {} };

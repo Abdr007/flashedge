@@ -56,6 +56,79 @@ export const flashCloseAll: ToolDefinition = {
   },
 };
 
+// ─── Reverse Position ────────────────────────────────────────────────────────
+
+export const flashReversePosition: ToolDefinition = {
+  name: 'flash_reverse_position',
+  description: 'Reverse a position (close current + open opposite side in one transaction)',
+  parameters: z.object({
+    market: z.string(),
+    side: z.string(),
+  }),
+  execute: async (params, context): Promise<ToolResult> => {
+    const market = (params.market as string).toUpperCase();
+    const sideStr = (params.side as string).toLowerCase();
+    const side = sideStr === 'long' ? TradeSide.Long : TradeSide.Short;
+
+    if (context.simulationMode) {
+      return { success: false, message: chalk.dim('  Reverse position requires live mode.') };
+    }
+
+    if (!context.flashClient.reversePosition) {
+      return { success: false, message: '  Reverse position not supported by the current client.' };
+    }
+
+    // Show current position info
+    const positions = await context.flashClient.getPositions();
+    const pos = positions.find((p) => p.market?.toUpperCase() === market && p.side === side);
+    if (!pos) {
+      return { success: false, message: `  No open ${sideStr} position on ${market} to reverse.` };
+    }
+
+    const newSide = side === TradeSide.Long ? 'SHORT' : 'LONG';
+    const isLive = !context.simulationMode;
+    const client = context.flashClient;
+
+    const lines = [
+      '',
+      `  ${theme.accentBold('CONFIRM TRANSACTION — Reverse Position')}`,
+      `  ${theme.separator(35)}`,
+      `  Market:      ${market} ${sideStr.toUpperCase()} → ${newSide}`,
+      `  Size:    $${pos.sizeUsd.toFixed(2)}`,
+      `  Entry:   $${pos.entryPrice.toFixed(4)}`,
+      `  PnL:     ${colorPnl(pos.unrealizedPnl)}`,
+      `  Wallet:      ${context.walletAddress}`,
+      '',
+    ];
+
+    return {
+      success: true,
+      message: lines.join('\n'),
+      requiresConfirmation: true,
+      confirmationPrompt: isLive ? 'Type "yes" to sign or "no" to cancel' : 'Confirm?',
+      data: {
+        executeAction: async (): Promise<ToolResult> => {
+          console.log('  Submitting transaction...');
+          try {
+            const result = await client.reversePosition!(market, side);
+            const resultLines = [
+              `  ${chalk.green('✔')} Position reversed`,
+              `  ${chalk.dim('From:')} ${market} ${sideStr.toUpperCase()} → ${chalk.dim('To:')} ${market} ${result.newSide.toUpperCase()}`,
+              `  New Entry:    $${result.newEntryPrice.toFixed(4)}`,
+              `  New Size:     $${result.newSizeUsd.toFixed(2)}`,
+              `  New Leverage: ${result.newLeverage.toFixed(1)}x`,
+              `  TX: https://solscan.io/tx/${result.txSignature}`,
+            ];
+            return { success: true, message: resultLines.join('\n') };
+          } catch (err: unknown) {
+            return { success: false, message: `  Failed to reverse position: ${getErrorMessage(err)}` };
+          }
+        },
+      },
+    };
+  },
+};
+
 // ─── TP/SL Tools (On-Chain via Flash SDK) ─────────────────────────────────────
 
 export const setTpSlTool: ToolDefinition = {
@@ -486,6 +559,7 @@ export const limitOrderListTool: ToolDefinition = {
 
 export const allOrderTools: ToolDefinition[] = [
   flashCloseAll,
+  flashReversePosition,
   setTpSlTool,
   removeTpSlTool,
   tpSlStatusTool,

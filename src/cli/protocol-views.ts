@@ -227,14 +227,14 @@ export async function protocolVerify(deps: ProtocolViewDeps): Promise<void> {
       const oracleStart = Date.now();
       const price = await timedTask(priceSvc.getPrice('SOL'), 'Oracle fetch');
       if (!price || !Number.isFinite(price.price) || price.price <= 0) {
-        return { label: 'Oracle', ok: false, detail: '', error: 'Failed to fetch SOL price from Pyth Hermes' };
+        return { label: 'Oracle', ok: false, detail: '', error: 'Failed to fetch SOL price from Flash API' };
       }
-      // Check timestamp freshness (< 5 seconds)
-      const age = price.timestamp ? Date.now() / 1000 - price.timestamp : 0;
-      if (age > 5) {
+      // Check timestamp freshness (< 30 seconds — Flash API caches prices)
+      const age = price.timestamp ? (Date.now() - price.timestamp) / 1000 : 0;
+      if (age > 30) {
         return { label: 'Oracle', ok: false, detail: '', error: `Oracle data stale (${age.toFixed(0)}s old)` };
       }
-      return { label: 'Oracle', ok: true, detail: `healthy (Pyth Hermes — ${Date.now() - oracleStart}ms)` };
+      return { label: 'Oracle', ok: true, detail: `healthy (Flash API — ${Date.now() - oracleStart}ms)` };
     } catch (err: unknown) {
       return { label: 'Oracle', ok: false, detail: '', error: getErrorMessage(err) };
     }
