@@ -1,0 +1,54 @@
+# Source (compiled output in dist/ is published)
+src/
+test/
+tests/
+docs-site/
+docs/
+coverage/
+Formula/
+/tools/
+scripts/
+assets/
+
+# Config files
+tsconfig.json
+eslint.config.js
+.prettierrc
+.prettierignore
+.husky/
+vitest.config.ts
+Dockerfile
+.dockerignore
+CONTRIBUTING.md
+
+# Development
+.env
+.env.*
+.github/
+.vscode/
+.idea/
+
+# Wallet & keys — NEVER publish
+*.key
+*.pem
+wallet.json
+id.json
+*-keypair.json
+.flash/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+*.log.*
+logs/
+
+# Build metadata
+*.tsbuildinfo
+*.js.map
+
+# Release artifacts
+*.tar.gz
+*.sha256

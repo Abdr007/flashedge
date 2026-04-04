@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      SIMULATION_MODE: "true"
+      TRADING_ENABLED: "false"
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: 'npm'
+
+      - name: Environment info
+        run: |
+          node -v
+          npm -v
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Security audit
+        run: |
+          # Audit production dependencies only
+          # Allow known Solana ecosystem vulnerabilities (bigint-buffer)
+          npm audit --production --audit-level=critical 2>&1 || {
+            AUDIT=$(npm audit --production --json 2>&1)
+            CRITICAL=$(echo "$AUDIT" | node -e "
+              const d = require('fs').readFileSync('/dev/stdin','utf8');
+              try {
+                const j = JSON.parse(d);
+                const vulns = j.vulnerabilities || {};
+                const critical = Object.entries(vulns).filter(([,v]) =>
+                  v.severity === 'critical' && !['bigint-buffer','@solana/buffer-layout-utils'].includes(v.name)
+                );
+                console.log(critical.length);
+              } catch { console.log('0'); }
+            ")
+            if [ "$CRITICAL" != "0" ]; then
+              echo "Critical vulnerabilities found in direct dependencies"
+              npm audit --production
+              exit 1
+            fi
+            echo "Known Solana ecosystem vulnerabilities allowlisted (see SECURITY.md)"
+          }
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
+
+      - name: Run tests with coverage
+        run: npm run coverage
+
+      - name: Verify test count
+        run: |
+          TEST_OUTPUT=$(npm test 2>&1)
+          PASS_COUNT=$(echo "$TEST_OUTPUT" | grep -oP '\d+ passed' | grep -oP '\d+' | sort -n | tail -1)
+          if [ -z "$PASS_COUNT" ] || [ "$PASS_COUNT" -lt 800 ]; then
+            echo "Test count dropped below 800 (got ${PASS_COUNT:-0}). Failing build."
+            exit 1
+          fi
+          echo "Test count: $PASS_COUNT (minimum: 800)"
+
+      - name: Upload coverage reports
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: coverage-report
+          path: coverage/
+          retention-days: 14

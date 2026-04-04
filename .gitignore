@@ -1,0 +1,56 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Environment & secrets
+.env
+.env.local
+.env.*.local
+
+# Wallet & keys — NEVER commit
+*.key
+*.pem
+wallet.json
+id.json
+*-keypair.json
+
+# Logs
+*.log
+flash-*.log
+logs/
+
+# Flash runtime data
+.flash/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# TypeScript
+*.js.map
+*.d.ts
+!src/**/*.d.ts
+*.tsbuildinfo
+
+# Auto-generated build metadata
+src/build-info.ts
+
+# Test coverage
+coverage/
+
+# Command history
+.flash_terminal_history
+
+# Generated PDFs (rebuild from markdown source)
+docs/*.pdf
+*.log.old
+*.log.old.*
+flash-debug.*

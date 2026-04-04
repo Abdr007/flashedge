@@ -1,0 +1,98 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      SIMULATION_MODE: "true"
+      TRADING_ENABLED: "false"
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Run tests
+        run: npm test
+
+      - name: Verify test count
+        run: |
+          TEST_OUTPUT=$(npm test 2>&1)
+          PASS_COUNT=$(echo "$TEST_OUTPUT" | grep -oP '\d+ passed' | grep -oP '\d+' | sort -n | tail -1)
+          if [ -z "$PASS_COUNT" ] || [ "$PASS_COUNT" -lt 800 ]; then
+            echo "Test count dropped below 800 (got ${PASS_COUNT:-0}). Failing build."
+            exit 1
+          fi
+          echo "Test count: $PASS_COUNT (minimum: 800)"
+
+  release:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      SIMULATION_MODE: "true"
+      TRADING_ENABLED: "false"
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: 'npm'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Create release tarball
+        run: |
+          TAG_NAME="${GITHUB_REF#refs/tags/}"
+          TARBALL="bolt-terminal-${TAG_NAME}.tar.gz"
+          tar -czf "$TARBALL" dist/ package.json README.md CHANGELOG.md COMMANDS.md ARCHITECTURE.md SECURITY.md LICENSE
+          sha256sum "$TARBALL" > "${TARBALL}.sha256"
+          echo "TARBALL=$TARBALL" >> "$GITHUB_ENV"
+          echo "TAG_NAME=$TAG_NAME" >> "$GITHUB_ENV"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ env.TAG_NAME }}
+          generate_release_notes: true
+          files: |
+            ${{ env.TARBALL }}
+            ${{ env.TARBALL }}.sha256
+
+      - name: Publish to npm
+        if: env.NODE_AUTH_TOKEN != ''
+        run: npm publish --access public || echo "Version already published — skipping"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

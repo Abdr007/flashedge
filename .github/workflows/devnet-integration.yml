@@ -1,0 +1,60 @@
+name: Devnet Integration Tests
+
+on:
+  schedule:
+    # Run every Monday at 06:00 UTC
+    - cron: '0 6 * * 1'
+  workflow_dispatch: # Allow manual trigger
+
+jobs:
+  devnet-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      SIMULATION_MODE: "false"
+      TRADING_ENABLED: "false"
+      NETWORK: "devnet"
+      RPC_URL: "https://api.devnet.solana.com"
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Run devnet integration tests
+        run: npx vitest run test/devnet-smoke.test.ts --reporter=verbose
+        continue-on-error: true
+
+      - name: Verify Flash SDK compatibility
+        run: |
+          # Quick sanity check — can we import and initialize the SDK?
+          node -e "
+            const { PoolConfig } = require('flash-sdk');
+            try {
+              const pc = PoolConfig.fromIdsByName('Crypto.1', 'devnet');
+              console.log('Flash SDK init: OK');
+              console.log('Pool:', pc.poolName);
+              console.log('Markets:', pc.markets?.length ?? 'N/A');
+            } catch (e) {
+              console.error('Flash SDK init: FAILED');
+              console.error(e.message);
+              process.exit(1);
+            }
+          "
+
+      - name: Report results
+        if: failure()
+        run: |
+          echo "::warning::Devnet integration tests failed. Flash SDK may have breaking changes."
+          echo "Review test output and check https://github.com/AdrenaFoundation/flash-sdk for updates."
