@@ -5,6 +5,7 @@ import { getLogger } from '../utils/logger.js';
 import { getErrorMessage } from '../utils/retry.js';
 import { getServiceBreaker } from '../core/circuit-breaker-service.js';
 import { atomicWriteFileSync } from '../system/safe-file.js';
+import { getFlashApiClient } from './flash-api.js';
 
 export interface TokenPrice {
   symbol: string;
@@ -14,20 +15,10 @@ export interface TokenPrice {
   isFallback: boolean;
 }
 
-// Pyth Hermes feed IDs — loaded dynamically from Market Registry (SDK source of truth).
-// No hardcoded feed IDs. New markets added via `npm update flash-sdk` are auto-discovered.
-import { getAllPythFeedIds, getPythFeedIdFromRegistry } from '../markets/index.js';
+// Pyth feed ID lookup — used for diagnostics display (protocol-views.ts), NOT for price fetching.
+import { getPythFeedIdFromRegistry } from '../markets/index.js';
 
-/** Lazily-loaded Pyth feed ID map from SDK PoolConfig.json. */
-let _pythFeedIds: Record<string, string> | null = null;
-function getPythFeedIds(): Record<string, string> {
-  if (!_pythFeedIds) _pythFeedIds = getAllPythFeedIds();
-  return _pythFeedIds;
-}
-
-const FETCH_TIMEOUT_MS = 8_000;
 const MAX_PRICE_CACHE_ENTRIES = 500;
-const MAX_RESPONSE_BYTES = 1024 * 1024; // 1MB max
 
 // 24h price history: record Pyth price snapshots, compute 24h change from oracle data.
 // This is the ONLY source of 24h price change — no external APIs.
@@ -37,12 +28,6 @@ const MAX_HISTORY_PER_SYMBOL = 1440; // 24h at 1min intervals
 const DISK_SAVE_INTERVAL_MS = 30_000; // persist to disk every 30 seconds
 const HISTORY_FILE = join(homedir(), '.flash', 'price-history.json');
 const MAX_HISTORY_FILE_BYTES = 5 * 1024 * 1024; // 5MB max file size
-
-interface PythParsedPrice {
-  id: string;
-  price: { price: string; expo: number; publish_time: number };
-  ema_price: { price: string; expo: number };
-}
 
 interface PriceSnapshot {
   price: number;
@@ -107,17 +92,21 @@ export class PriceService {
       for (const [k] of toEvict) this.cache.delete(k);
     }
 
-    // Fetch from Pyth Hermes
+    // ── Flash API = SOLE price source ──
+    // Flash API GET /prices is the authoritative and only price feed.
+    // No Pyth fallback. No dual-path logic.
     try {
-      logger.debug('PRICE', `Fetching prices from Pyth Hermes for: ${uncached.join(', ')}`);
-      const fetched = await this.fetchFromPyth(uncached);
-      for (const tp of fetched) {
+      logger.debug('PRICE', `Fetching prices from Flash API for: ${uncached.join(', ')}`);
+      const apiPrices = await this.fetchFromFlashApi(uncached);
+      for (const tp of apiPrices) {
         priceMap.set(tp.symbol, tp);
         this.cache.set(tp.symbol, { data: tp, expiry: now + this.cacheTtlMs });
       }
-      logger.info('PRICE', `Fetched ${fetched.length} prices from Pyth Hermes`);
+      if (apiPrices.length > 0) {
+        logger.info('PRICE', `Flash API: ${apiPrices.length} prices fetched`);
+      }
     } catch (error: unknown) {
-      logger.warn('PRICE', `Pyth Hermes fetch failed: ${getErrorMessage(error)}`);
+      logger.warn('PRICE', `Flash API price fetch failed: ${getErrorMessage(error)}`);
     }
 
     // Record price history for 24h change computation
@@ -157,66 +146,46 @@ export class PriceService {
     return prices.get(symbol.toUpperCase()) ?? null;
   }
 
-  private async fetchFromPyth(symbols: string[]): Promise<TokenPrice[]> {
-    const feedIds: string[] = [];
-    const idToSymbol = new Map<string, string>();
-    for (const sym of symbols) {
-      const feedId = getPythFeedIds()[sym];
-      if (feedId) {
-        feedIds.push(feedId);
-        idToSymbol.set(feedId.slice(2), sym);
-      }
-    }
-
-    if (feedIds.length === 0) return [];
-
-    const cb = getServiceBreaker('pyth-hermes', { failureThreshold: 3, cooldownMs: 15_000, maxCooldownMs: 60_000, cooldownMultiplier: 2 });
-    if (!cb.allowRequest()) return []; // Circuit open — return empty, use cache
-
-    const params = feedIds.map((id) => `ids[]=${id}`).join('&');
-    const url = `https://hermes.pyth.network/v2/updates/price/latest?${params}&parsed=true`;
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  /**
+   * PRIMARY price fetcher using Flash Trade REST API (GET /prices).
+   * This is the SOLE price source — no Pyth, no fallback.
+   */
+  private async fetchFromFlashApi(symbols: string[]): Promise<TokenPrice[]> {
+    const cb = getServiceBreaker('flash-api-prices', {
+      failureThreshold: 3,
+      cooldownMs: 15_000,
+      maxCooldownMs: 60_000,
+      cooldownMultiplier: 2,
+    });
+    if (!cb.allowRequest()) return [];
 
     try {
-      const res = await fetch(url, {
-        signal: controller.signal,
-        headers: { Accept: 'application/json' },
-      });
-
-      if (!res.ok) {
-        throw new Error(`Pyth Hermes ${res.status}: ${res.statusText}`);
+      const client = getFlashApiClient();
+      const allPrices = await client.getAllPrices();
+      if (!allPrices || !Array.isArray(allPrices)) {
+        cb.recordFailure();
+        return [];
       }
 
-      const contentLength = res.headers.get('content-length');
-      if (contentLength && parseInt(contentLength, 10) > MAX_RESPONSE_BYTES) {
-        throw new Error(`Pyth response too large: ${contentLength} bytes`);
-      }
-
-      const text = await res.text();
-      if (text.length > MAX_RESPONSE_BYTES) {
-        throw new Error(`Pyth response body too large: ${text.length} bytes`);
-      }
-
-      const data = JSON.parse(text) as { parsed?: PythParsedPrice[] };
+      const symbolSet = new Set(symbols.map((s) => s.toUpperCase()));
       const results: TokenPrice[] = [];
       const now = Date.now();
 
-      for (const entry of data.parsed ?? []) {
-        const sym = idToSymbol.get(entry.id);
-        if (!sym) continue;
+      for (const apiPrice of allPrices) {
+        const sym = (apiPrice.symbol ?? '').toUpperCase();
+        if (!symbolSet.has(sym)) continue;
 
-        const price = parseInt(entry.price.price, 10) * Math.pow(10, entry.price.expo);
+        const price = apiPrice.price_ui ?? apiPrice.price * Math.pow(10, apiPrice.exponent ?? 0);
         if (!Number.isFinite(price) || price <= 0) continue;
 
-        // Price deviation circuit breaker — reject >50% jumps from cached value
+        // Price deviation check against cache
         const cached = this.cache.get(sym);
         if (cached && cached.data.price > 0) {
           const deviation = Math.abs(price - cached.data.price) / cached.data.price;
           if (deviation > 0.5) {
             getLogger().warn(
               'PRICE',
-              `Rejecting suspicious price for ${sym}: $${price} vs cached $${cached.data.price.toFixed(2)} (${(deviation * 100).toFixed(0)}% deviation)`,
+              `Flash API: rejecting suspicious ${sym}: $${price} vs cached $${cached.data.price.toFixed(2)}`,
             );
             continue;
           }
@@ -229,17 +198,15 @@ export class PriceService {
           price,
           priceChange24h,
           timestamp: now,
-          isFallback: false,
+          isFallback: true, // Mark as fallback source
         });
       }
 
       cb.recordSuccess();
       return results;
-    } catch (err) {
+    } catch {
       cb.recordFailure();
-      throw err;
-    } finally {
-      clearTimeout(timeout);
+      return [];
     }
   }
 

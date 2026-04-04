@@ -287,9 +287,10 @@ describe('Dynamic CU Fallback', () => {
       'overflow retry should still be at 260k');
   });
 
-  it('swapAndOpen still forces 420k minimum', () => {
+  it('API transaction builder handles CU budgets server-side', () => {
+    // After API-first migration, Flash API manages compute units for all trade types.
     const src = readFileSync(resolve(ROOT, 'src/client/flash-client.ts'), 'utf8');
-    assert.ok(src.includes("isSwapAndOpen ? Math.max(this.config.computeUnitLimit, 420_000)"),
-      'swapAndOpen should still force 420k');
+    assert.ok(src.includes('executeOpenPosition'),
+      'openPosition should delegate to API execution');
   });
 });

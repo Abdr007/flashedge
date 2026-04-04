@@ -1,15 +1,15 @@
 /**
  * Pool Live Data
  *
- * Primary source: Flash Trade official API (api.prod.flash.trade/earn-page/data)
- * - Pre-calculated APY/APR per pool (matches Flash Trade Earn page exactly)
- * - FLP/sFLP prices, AUM
+ * SOLE source: Flash API GET /pool-data (flashapi.trade)
+ * - Pre-calculated APY/APR per pool
+ * - FLP/sFLP prices, AUM, custody stats
  *
  * Secondary source: fstats.io /pools
- * - Total volume, total fees, total trades (not in official API)
+ * - Total volume, total fees, total trades (supplementary analytics)
  *
  * Fallback: fstats.io /fees/daily + /volume/daily (volume-weighted fee APY)
- * - Used only when official API is unavailable
+ * - Used only when Flash API pool data lacks APY fields
  */
 
 import { Connection } from '@solana/web3.js';
@@ -19,8 +19,7 @@ import { join } from 'path';
 import { getPoolRegistry } from './pool-registry.js';
 import { FSTATS_BASE_URL } from '../config/index.js';
 import { getLogger } from '../utils/logger.js';
-
-const FLASH_EARN_API = 'https://api.prod.flash.trade/earn-page/data';
+import { getFlashApiClient } from '../data/flash-api.js';
 
 // ─── Flash Trade Official API Types ─────────────────────────────────────────
 
@@ -35,11 +34,6 @@ interface FlashEarnPool {
   sflpDailyApr: number | null;
   flpPrice: string;
   sFlpPrice: string;
-}
-
-interface FlashEarnResponse {
-  pools: FlashEarnPool[];
-  lastUpdated: number;
 }
 
 // ─── FLP Price Snapshots ─────────────────────────────────────────────────────
@@ -129,24 +123,39 @@ export function setPoolDataConnection(conn: Connection): void {
   _rpcConnection = conn;
 }
 
-/** Fetch official APY/price data from Flash Trade API. */
+/** Fetch official APY/price data from Flash API GET /pool-data.
+ *  This is the SOLE source — no legacy fallback.
+ */
 async function fetchOfficialEarnData(logger: ReturnType<typeof getLogger>): Promise<Map<string, FlashEarnPool> | null> {
   try {
-    const res = await fetch(FLASH_EARN_API, { signal: AbortSignal.timeout(6000) });
-    if (!res.ok) return null;
-    const json = (await res.json()) as FlashEarnResponse;
-    if (!json.pools || !Array.isArray(json.pools)) return null;
-
-    const map = new Map<string, FlashEarnPool>();
-    for (const p of json.pools) {
-      if (p.flpTokenSymbol) map.set(p.flpTokenSymbol, p);
+    const apiPools = await getFlashApiClient().getPoolDataLegacy();
+    if (apiPools && apiPools.length > 0) {
+      const map = new Map<string, FlashEarnPool>();
+      for (const p of apiPools) {
+        if (p.flpTokenSymbol) {
+          map.set(p.flpTokenSymbol, {
+            poolAddress: p.poolAddress,
+            aum: p.aum,
+            flpTokenSymbol: p.flpTokenSymbol,
+            sflpTokenSymbol: p.sflpTokenSymbol,
+            flpDailyApy: p.flpDailyApy,
+            flpWeeklyApy: p.flpWeeklyApy,
+            sflpWeeklyApr: p.sflpWeeklyApr,
+            sflpDailyApr: p.sflpDailyApr,
+            flpPrice: p.flpPrice,
+            sFlpPrice: p.sFlpPrice,
+          });
+        }
+      }
+      if (map.size > 0) {
+        logger.debug('EARN', `Flash API /pool-data: ${map.size} pools loaded`);
+        return map;
+      }
     }
-    logger.debug('EARN', `Official API: ${map.size} pools loaded`);
-    return map;
   } catch {
-    logger.debug('EARN', 'Official Flash Trade earn API unavailable');
-    return null;
+    logger.debug('EARN', 'Flash API /pool-data unavailable');
   }
+  return null;
 }
 
 /** Fetch supplementary data (volume, fees, trades) from fstats. */

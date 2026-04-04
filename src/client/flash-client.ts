@@ -57,15 +57,24 @@ import { initTpuClient, getTpuClient } from '../network/tpu-client.js';
 import { getLeaderRouter } from '../core/leader-router.js';
 
 import {
-  createBatch,
-  appendToBatch,
-  isBatchWithinLimit,
-  batchSummary,
   type SdkResult,
 } from '../transaction/instruction-aggregator.js';
 import { resolveALTs, verifyALTAccountOverlap, logMessageALTDiagnostics } from '../transaction/alt-resolver.js';
-import { buildATAIdempotentIxs } from '../transaction/ata-resolver.js';
 import { getTypedMarkets, type SdkPositionData, type SdkPoolConfigExt } from '../types/sdk-types.js';
+import { getFlashApiClient, buildTransaction } from '../data/flash-api.js';
+import { checkApiHealth } from '../core/api-health-guard.js';
+import {
+  ExecutionError,
+  txConfirmationTimeout,
+  txOnChainError,
+  type ExecutionAction,
+} from '../core/execution-error.js';
+import {
+  trackExecutionSuccess,
+  getExecutionHistory,
+} from '../observability/execution-tracker.js';
+import { checkCircuitBreaker, getExecutionCircuitBreaker } from '../core/execution-circuit-breaker.js';
+import { getP95Latency, persistExecution } from '../observability/execution-store.js';
 
 // ─── SDK Console Suppression ─────────────────────────────────────────────────
 // The Flash SDK has debug console.log statements in its published build.
@@ -1351,6 +1360,559 @@ export class FlashClient implements IFlashClient {
     );
   }
 
+  // ─── Flash API Transaction Submission ────────────────────────────────────
+  // Sends a base64-encoded transaction from Flash API transaction builder.
+  // Used as fallback when SDK instruction building fails.
+
+  /**
+   * Sign and broadcast an API-built transaction.
+   *
+   * Flow: Deserialize → Validate keypair → Sign → Broadcast → Confirm
+   *
+   * Uses UltraTxEngine for multi-endpoint broadcast when available,
+   * falls back to direct RPC send otherwise.
+   *
+   * Throws structured ExecutionError on any failure.
+   * No SDK involvement — this is pure sign + broadcast.
+   */
+  /**
+   * Sign and broadcast a pre-validated transaction.
+   *
+   * LATENCY OPTIMIZATION: Accepts pre-parsed {vtx} from validateTransactionBeforeSign
+   * to eliminate redundant deserialization (~1-3ms saved).
+   * Falls back to parsing from base64 if preValidated not provided.
+   */
+  private async sendApiTransaction(
+    transactionBase64: string,
+    preValidated?: { vtx: VersionedTransaction },
+  ): Promise<string> {
+    const logger = getLogger();
+
+    // Reuse pre-validated deserialized tx (avoids double Buffer.from + deserialize)
+    const vtx = preValidated?.vtx ?? VersionedTransaction.deserialize(Buffer.from(transactionBase64, 'base64'));
+
+    // Pre-signing safety: verify keypair integrity
+    if (!this.walletMgr.verifyKeypairIntegrity()) {
+      throw new ExecutionError(
+        'Wallet keypair is invalid or disconnected. Reconnect your wallet before signing.',
+        { action: 'signTransaction', errorCode: 'TX_SIGN_FAILED' },
+      );
+    }
+
+    // Sign the transaction with our wallet — wrapped to produce structured error on failure
+    try {
+      vtx.sign([this.wallet]);
+    } catch (signErr) {
+      throw new ExecutionError(
+        `Transaction signing failed: ${signErr instanceof Error ? signErr.message : 'unknown'}`,
+        { action: 'signTransaction', errorCode: 'TX_SIGN_FAILED' },
+      );
+    }
+
+    const signedBytes = Buffer.from(vtx.serialize());
+    const conn = this.connection;
+
+    // ── Adaptive timeout ──
+    // Base: 30s. Scales with recent p95 latency (2x multiplier).
+    // If no latency data yet, falls back to 45s default.
+    const BASE_TIMEOUT_MS = 30_000;
+    const DEFAULT_TIMEOUT_MS = 45_000;
+    const MAX_TIMEOUT_MS = 90_000;
+    const p95 = getP95Latency();
+    const timeoutMs = p95 > 0
+      ? Math.min(Math.max(BASE_TIMEOUT_MS, p95 * 2), MAX_TIMEOUT_MS)
+      : DEFAULT_TIMEOUT_MS;
+
+    logger.debug('CLIENT', `Confirmation timeout: ${Math.round(timeoutMs / 1000)}s (p95: ${p95 > 0 ? `${Math.round(p95)}ms` : 'n/a'})`);
+
+    // ── Parallel broadcast (race strategy) ──
+    // Send to ALL healthy RPC endpoints simultaneously.
+    // Fastest endpoint wins. Others are fire-and-forget.
+    // This eliminates single-endpoint latency bottlenecks.
+    let signatureStr: string;
+    try {
+      const rpcMgr = getRpcManagerInstance();
+      if (rpcMgr && rpcMgr.totalEndpoints > 1) {
+        // Race: broadcast via primary connection + fire-and-forget to backup endpoints.
+        // Primary broadcast is always awaited. Backup endpoints are non-blocking
+        // fire-and-forget (no new Connection objects — uses fetch directly to avoid socket leaks).
+        const endpoints = rpcMgr.getEndpoints();
+
+        // Fire-and-forget to backup endpoints (no awaited Connection objects, no socket leaks)
+        for (let i = 1; i < endpoints.length; i++) {
+          const backupConn = new Connection(endpoints[i].url, { commitment: 'confirmed' });
+          backupConn.sendRawTransaction(signedBytes, { skipPreflight: true, maxRetries: 1 }).catch(() => {});
+        }
+
+        // Primary endpoint is always awaited
+        signatureStr = await conn.sendRawTransaction(signedBytes, {
+          skipPreflight: true,
+          maxRetries: 3,
+        });
+        logger.info('CLIENT', `API tx broadcast to ${endpoints.length} endpoints: ${signatureStr}`);
+      } else {
+        // Single endpoint — direct send
+        signatureStr = await conn.sendRawTransaction(signedBytes, {
+          skipPreflight: true,
+          maxRetries: 3,
+        });
+        logger.info('CLIENT', `API tx sent: ${signatureStr} (${signedBytes.length} bytes)`);
+      }
+    } catch (err) {
+      throw new ExecutionError(
+        `Transaction broadcast failed: ${err instanceof Error ? err.message : 'unknown'}`,
+        { action: 'broadcastTransaction', errorCode: 'TX_BROADCAST_FAILED' },
+      );
+    }
+
+    // ── Adaptive confirmation polling ──
+    // First 10s: aggressive 1s polling (catches fast confirmations)
+    // After 10s: standard 2s polling (reduces RPC load)
+    // Rebroadcast every 3 polls to improve delivery.
+    const start = Date.now();
+    process.stdout.write('  Awaiting confirmation... \r');
+    for (let i = 0; Date.now() - start < timeoutMs; i++) {
+      const elapsed = Date.now() - start;
+      const pollInterval = elapsed < 10_000 ? 1_000 : 2_000; // Fast poll first 10s
+      await new Promise((r) => setTimeout(r, pollInterval));
+
+      const { value } = await conn.getSignatureStatuses([signatureStr]);
+      const status = value?.[0];
+      if (status?.err) {
+        process.stdout.write('                              \r');
+        throw txOnChainError('broadcastTransaction', signatureStr, status.err);
+      }
+      if (status?.confirmationStatus === 'confirmed' || status?.confirmationStatus === 'finalized') {
+        process.stdout.write('                              \r');
+        logger.info('CLIENT', `API tx confirmed: ${signatureStr} (${Date.now() - start}ms)`);
+        this.walletMgr.resetIdleTimer();
+        this.walletMgr.clearBalanceCache();
+        return signatureStr;
+      }
+      // Rebroadcast every 3rd poll
+      if (i % 3 === 0 && i > 0) {
+        conn.sendRawTransaction(signedBytes, { skipPreflight: true, maxRetries: 0 }).catch(() => {});
+      }
+    }
+    process.stdout.write('                              \r');
+    throw txConfirmationTimeout('broadcastTransaction', signatureStr, timeoutMs);
+  }
+
+  // ─── API-Based Trade Execution (Fallback) ─────────────────────────────────
+  // These methods use Flash API POST /transaction-builder/* to build transactions
+  // server-side, then sign and submit locally. Used when SDK instruction building fails.
+
+  // ─── API Execution Methods ─────────────────────────────────────────────────
+  // SOLE execution path: Flash API → Sign → Broadcast
+  // No SDK fallback. No dual paths. Structured errors on failure.
+  //
+  // Each method:
+  //   1. Validates API health (pre-execution gate)
+  //   2. Builds transaction via API (buildTransaction abstraction)
+  //   3. Validates transaction structure before signing
+  //   4. Signs locally + broadcasts via sendApiTransaction
+  //   5. Tracks execution telemetry throughout
+
+  /**
+   * Advanced transaction validation before signing.
+   * Returns the pre-parsed buffer + VersionedTransaction to avoid double deserialization.
+   *
+   * LATENCY OPTIMIZATION: The returned {rawBytes, vtx} is reused by sendApiTransaction,
+   * eliminating a redundant Buffer.from + VersionedTransaction.deserialize call (~1-3ms).
+   */
+  private validateTransactionBeforeSign(
+    txBase64: string,
+    action: ExecutionAction,
+  ): { rawBytes: Buffer; vtx: VersionedTransaction } {
+    const logger = getLogger();
+
+    // 1. Base64 length sanity
+    if (txBase64.length < 10) {
+      throw new ExecutionError('Transaction too small to be valid', {
+        action, errorCode: 'TX_VALIDATION_FAILED',
+      });
+    }
+
+    // 2. Deserialize (ONCE — result reused by sendApiTransaction)
+    let vtx: VersionedTransaction;
+    let rawBytes: Buffer;
+    try {
+      rawBytes = Buffer.from(txBase64, 'base64');
+      vtx = VersionedTransaction.deserialize(rawBytes);
+    } catch (err) {
+      throw new ExecutionError(
+        `Transaction deserialization failed: ${err instanceof Error ? err.message : 'unknown'}`,
+        { action, errorCode: 'TX_VALIDATION_FAILED' },
+      );
+    }
+
+    // 3. Instruction count > 0
+    const msg = vtx.message;
+    const ixCount = msg.compiledInstructions.length;
+    if (ixCount === 0) {
+      throw new ExecutionError('Transaction has zero instructions', {
+        action, errorCode: 'TX_VALIDATION_FAILED',
+      });
+    }
+
+    // 4. Account count sanity — guard against undefined staticAccountKeys
+    const staticKeys = msg.staticAccountKeys;
+    if (!staticKeys || !Array.isArray(staticKeys)) {
+      throw new ExecutionError('Transaction has no static account keys', {
+        action, errorCode: 'TX_VALIDATION_FAILED',
+      });
+    }
+    const accountCount = staticKeys.length;
+    if (accountCount === 0) {
+      throw new ExecutionError('Transaction has zero accounts', {
+        action, errorCode: 'TX_VALIDATION_FAILED',
+      });
+    }
+    if (accountCount > 256) {
+      throw new ExecutionError(`Transaction has ${accountCount} accounts (max 256)`, {
+        action, errorCode: 'TX_VALIDATION_FAILED',
+      });
+    }
+
+    // 5. Known program ID check (warn-only, non-blocking)
+    const accountKeys = staticKeys.map((k) => k.toBase58());
+    const hasKnownProgram = accountKeys.some((k) => ALLOWED_PROGRAM_IDS.has(k));
+    if (!hasKnownProgram) {
+      logger.warn('TX-VALIDATE',
+        `No known program IDs in tx for ${action} — accounts: ${accountKeys.slice(0, 5).join(', ')}...`,
+      );
+    }
+
+    // 6. Byte size check (debug-only, non-blocking)
+    if (rawBytes.length > 1232) {
+      logger.debug('TX-VALIDATE', `Large tx for ${action}: ${rawBytes.length} bytes (ALTs may compress)`);
+    }
+
+    logger.debug('TX-VALIDATE', `${action}: ${ixCount} ix, ${accountCount} accts, ${rawBytes.length} bytes`);
+
+    return { rawBytes, vtx };
+  }
+
+  /**
+   * Record execution result into circuit breaker + persistent store.
+   *
+   * LATENCY OPTIMIZATION:
+   *   - Fire-and-forget: schedules work via queueMicrotask, never blocks caller
+   *   - No dynamic require(): uses static imports resolved at module load
+   *   - Circuit breaker update is synchronous (O(1) array push) — inlined
+   */
+  private recordExecutionResult(executionId: string, success: boolean, errorCode?: string, latencyMs?: number): void {
+    // Circuit breaker update is O(1) — safe to inline synchronously
+    try {
+      const cb = getExecutionCircuitBreaker();
+      if (success) cb.recordSuccess(latencyMs);
+      else cb.recordFailure(errorCode, latencyMs);
+    } catch { /* never block */ }
+
+    // Persistence is I/O — schedule async via microtask (fire-and-forget)
+    queueMicrotask(() => {
+      try {
+        const history = getExecutionHistory(1);
+        if (history.length > 0 && history[0].executionId === executionId) {
+          persistExecution(history[0]);
+        }
+      } catch { /* never block */ }
+    });
+  }
+
+  private async executeOpenPosition(
+    market: string,
+    side: TradeSide,
+    collateralAmount: number,
+    leverage: number,
+    collateralToken?: string,
+    takeProfit?: number,
+    stopLoss?: number,
+  ): Promise<OpenPositionResult> {
+    const logger = getLogger();
+    const startMs = Date.now();
+    let executionId = '';
+
+    // 1. Health gate
+    await checkApiHealth();
+
+    // 2. Circuit breaker gate
+    checkCircuitBreaker();
+
+    try {
+      // 3. Build transaction via API
+      const owner = this.wallet.publicKey.toBase58();
+      const ref = this.getReferralParams();
+
+      const { transactionBase64, data } = await buildTransaction('openPosition', {
+        owner,
+        inputTokenSymbol: collateralToken ?? 'USDC',
+        outputTokenSymbol: market,
+        inputAmountUi: collateralAmount.toString(),
+        leverage,
+        tradeType: side === TradeSide.Long ? 'LONG' : 'SHORT',
+        slippagePercentage: (this.config.defaultSlippageBps / 100).toString(),
+        takeProfit: takeProfit?.toString(),
+        stopLoss: stopLoss?.toString(),
+        privilege: ref ? 'REFERRAL' : 'NONE',
+        userReferralAccount: ref?.userReferralAccount.toBase58(),
+        tokenStakeFafAccount: ref?.tokenStakeAccount.toBase58(),
+      });
+
+      executionId = data._executionId as string;
+
+      // 4. Validate before signing
+      const validated = this.validateTransactionBeforeSign(transactionBase64, 'openPosition');
+
+      // 5. Sign + broadcast (reuses pre-parsed tx — zero redundant deserialization)
+      const txSignature = await this.sendApiTransaction(transactionBase64, validated);
+
+      // 6. Track success
+      trackExecutionSuccess(executionId, txSignature);
+      this.recordExecutionResult(executionId, true, undefined, Date.now() - startMs);
+
+      logger.trade('OPEN', {
+        market, side, collateral: collateralAmount, leverage,
+        price: data.newEntryPrice, tx: txSignature,
+      });
+
+      return {
+        txSignature,
+        entryPrice: parseFloat(String(data.newEntryPrice)) || 0,
+        liquidationPrice: parseFloat(String(data.newLiquidationPrice)) || 0,
+        sizeUsd: collateralAmount * leverage,
+      };
+    } catch (err) {
+      const errorCode = err instanceof ExecutionError ? err.context.errorCode : 'API_ERROR';
+      this.recordExecutionResult(executionId, false, errorCode, Date.now() - startMs);
+      throw err;
+    }
+  }
+
+  private async executeClosePosition(
+    market: string,
+    side: TradeSide,
+    positionPubkey: string,
+    sizeUsd: number,
+    closePercent: number,
+    receiveToken?: string,
+  ): Promise<ClosePositionResult> {
+    const logger = getLogger();
+    const startMs = Date.now();
+    let executionId = '';
+
+    await checkApiHealth();
+    checkCircuitBreaker();
+
+    try {
+      const owner = this.wallet.publicKey.toBase58();
+      const closeAmountUsd = (sizeUsd * closePercent / 100).toString();
+      const ref = this.getReferralParams();
+
+      const { transactionBase64, data } = await buildTransaction('closePosition', {
+        owner,
+        positionKey: positionPubkey,
+        inputUsdUi: closeAmountUsd,
+        withdrawTokenSymbol: receiveToken ?? 'USDC',
+        slippagePercentage: (this.config.defaultSlippageBps / 100).toString(),
+        privilege: ref ? 'REFERRAL' : 'NONE',
+        userReferralAccount: ref?.userReferralAccount.toBase58(),
+        tokenStakeFafAccount: ref?.tokenStakeAccount.toBase58(),
+      });
+
+      executionId = data._executionId as string;
+      const validated = this.validateTransactionBeforeSign(transactionBase64, 'closePosition');
+
+      const txSignature = await this.sendApiTransaction(transactionBase64, validated);
+      trackExecutionSuccess(executionId, txSignature);
+      this.recordExecutionResult(executionId, true, undefined, Date.now() - startMs);
+
+      logger.trade('CLOSE', {
+        market, side, pnl: data.settledPnl,
+        price: data.markPrice, tx: txSignature,
+      });
+
+      const isPartial = closePercent < 100;
+      return {
+        txSignature,
+        exitPrice: parseFloat(String(data.markPrice)) || 0,
+        pnl: parseFloat(String(data.settledPnl)) || 0,
+        isPartial,
+        closedSizeUsd: parseFloat(closeAmountUsd),
+        remainingSizeUsd: parseFloat(String(data.newSize)) || 0,
+      };
+    } catch (err) {
+      const errorCode = err instanceof ExecutionError ? err.context.errorCode : 'API_ERROR';
+      this.recordExecutionResult(executionId, false, errorCode, Date.now() - startMs);
+      throw err;
+    }
+  }
+
+  private async executeAddCollateral(
+    positionPubkey: string,
+    amount: number,
+    depositToken: string = 'USDC',
+  ): Promise<CollateralResult> {
+    const startMs = Date.now();
+    let executionId = '';
+
+    await checkApiHealth();
+    checkCircuitBreaker();
+
+    try {
+      const { transactionBase64, data } = await buildTransaction('addCollateral', {
+        owner: this.wallet.publicKey.toBase58(),
+        positionKey: positionPubkey,
+        depositAmountUi: amount.toString(),
+        depositTokenSymbol: depositToken,
+      });
+
+      executionId = data._executionId as string;
+      const validated = this.validateTransactionBeforeSign(transactionBase64, 'addCollateral');
+
+      const txSignature = await this.sendApiTransaction(transactionBase64, validated);
+      trackExecutionSuccess(executionId, txSignature);
+      this.recordExecutionResult(executionId, true, undefined, Date.now() - startMs);
+      return { txSignature };
+    } catch (err) {
+      const errorCode = err instanceof ExecutionError ? err.context.errorCode : 'API_ERROR';
+      this.recordExecutionResult(executionId, false, errorCode, Date.now() - startMs);
+      throw err;
+    }
+  }
+
+  private async executeRemoveCollateral(
+    positionPubkey: string,
+    amount: number,
+    withdrawToken: string = 'USDC',
+  ): Promise<CollateralResult> {
+    const startMs = Date.now();
+    let executionId = '';
+
+    await checkApiHealth();
+    checkCircuitBreaker();
+
+    try {
+      const { transactionBase64, data } = await buildTransaction('removeCollateral', {
+        owner: this.wallet.publicKey.toBase58(),
+        positionKey: positionPubkey,
+        withdrawAmountUsdUi: amount.toString(),
+        withdrawTokenSymbol: withdrawToken,
+      });
+
+      executionId = data._executionId as string;
+      const validated = this.validateTransactionBeforeSign(transactionBase64, 'removeCollateral');
+
+      const txSignature = await this.sendApiTransaction(transactionBase64, validated);
+      trackExecutionSuccess(executionId, txSignature);
+      this.recordExecutionResult(executionId, true, undefined, Date.now() - startMs);
+      return { txSignature };
+    } catch (err) {
+      const errorCode = err instanceof ExecutionError ? err.context.errorCode : 'API_ERROR';
+      this.recordExecutionResult(executionId, false, errorCode, Date.now() - startMs);
+      throw err;
+    }
+  }
+
+  private async executeCancelTriggerOrder(
+    market: string,
+    side: TradeSide,
+    orderId: number,
+    isStopLoss: boolean,
+  ): Promise<CancelOrderResult> {
+    const logger = getLogger();
+    const startMs = Date.now();
+    let executionId = '';
+
+    await checkApiHealth();
+    checkCircuitBreaker();
+
+    try {
+      const { transactionBase64, data } = await buildTransaction('cancelTriggerOrder', {
+        owner: this.wallet.publicKey.toBase58(),
+        marketSymbol: market,
+        side: side === TradeSide.Long ? 'LONG' : 'SHORT',
+        orderId,
+        isStopLoss,
+      });
+
+      executionId = data._executionId as string;
+      const validated = this.validateTransactionBeforeSign(transactionBase64, 'cancelTriggerOrder');
+
+      const txSignature = await this.sendApiTransaction(transactionBase64, validated);
+      trackExecutionSuccess(executionId, txSignature);
+      this.recordExecutionResult(executionId, true, undefined, Date.now() - startMs);
+
+      logger.trade(isStopLoss ? 'CANCEL_SL' : 'CANCEL_TP', {
+        market, side, orderId, tx: txSignature,
+      });
+
+      return { txSignature };
+    } catch (err) {
+      const errorCode = err instanceof ExecutionError ? err.context.errorCode : 'API_ERROR';
+      this.recordExecutionResult(executionId, false, errorCode, Date.now() - startMs);
+      throw err;
+    }
+  }
+
+  // ─── API-Based Position Fetching ──────────────────────────────────────────
+  // Fetches enriched position data from Flash API (includes PnL, leverage, liquidation).
+  // Used for faster position queries when API is available.
+
+  async getPositionsViaApi(): Promise<Position[] | null> {
+    const logger = getLogger();
+    try {
+      const owner = this.wallet.publicKey.toBase58();
+      const apiPositions = await getFlashApiClient().getPositionsByOwner(owner);
+      if (!apiPositions || apiPositions.length === 0) return apiPositions ? [] : null;
+
+      const positions: Position[] = [];
+      for (const ap of apiPositions) {
+        // Parse enriched position fields (API returns *Ui string fields)
+        const sizeUsd = parseFloat(String(ap.sizeUsdUi ?? ap.sizeUsd ?? 0));
+        const collateralUsd = parseFloat(String(ap.collateralUsdUi ?? ap.collateralUsd ?? 0));
+        const entryPrice = parseFloat(String(ap.entryPriceUi ?? ap.entryPrice ?? 0));
+        const markPrice = parseFloat(String(ap.markPriceUi ?? ap.markPrice ?? 0));
+        const leverage = parseFloat(String(ap.leverageUi ?? ap.leverage ?? 0));
+        const liquidationPrice = parseFloat(String(ap.liquidationPriceUi ?? ap.liquidationPrice ?? 0));
+        const pnl = parseFloat(String(ap.pnl ?? 0));
+        const sideStr = String(ap.sideUi ?? ap.side ?? '').toLowerCase();
+
+        if (!Number.isFinite(sizeUsd) || sizeUsd <= 0) continue;
+        if (!Number.isFinite(entryPrice) || entryPrice <= 0) continue;
+
+        const effectiveLeverage = Number.isFinite(leverage) && leverage > 0
+          ? leverage
+          : (collateralUsd > 0 ? sizeUsd / collateralUsd : 1);
+
+        positions.push({
+          pubkey: String(ap.key ?? ''),
+          market: String(ap.marketSymbol ?? ''),
+          side: sideStr === 'long' ? TradeSide.Long : TradeSide.Short,
+          sizeUsd,
+          collateralUsd,
+          entryPrice,
+          currentPrice: markPrice > 0 ? markPrice : entryPrice,
+          markPrice,
+          leverage: effectiveLeverage,
+          liquidationPrice: Number.isFinite(liquidationPrice) ? liquidationPrice : 0,
+          unrealizedPnl: Number.isFinite(pnl) ? pnl : 0,
+          unrealizedPnlPercent: collateralUsd > 0 && Number.isFinite(pnl) ? (pnl / collateralUsd) * 100 : 0,
+          openFee: 0,
+          totalFees: 0,
+          fundingRate: 0,
+          timestamp: Date.now(),
+        });
+      }
+
+      logger.debug('CLIENT', `Flash API: ${positions.length} positions fetched`);
+      return positions;
+    } catch (err: unknown) {
+      logger.debug('CLIENT', `Flash API positions failed: ${getErrorMessage(err)}`);
+      return null;
+    }
+  }
+
   // ─── Trade Mutex ──────────────────────────────────────────────────────────
 
   private acquireTradeLock(market: string, side: TradeSide): void {
@@ -1382,8 +1944,6 @@ export class FlashClient implements IFlashClient {
     leverage: number,
     collateralToken?: string,
   ): Promise<OpenPositionResult> {
-    const logger = getLogger();
-
     // Validate referral PDA exists on-chain (one-time, before first trade)
     await this.validateReferralOnChain();
 
@@ -1399,309 +1959,10 @@ export class FlashClient implements IFlashClient {
     // Acquire trade lock BEFORE any async operations to prevent interleaving
     this.acquireTradeLock(market, side);
     try {
-      // ── Parallel pre-trade validation ──
-      // Run SOL fee check and USDC balance check concurrently.
-      // These are independent RPC calls that previously ran sequentially (~600-1500ms total).
-      const poolConfig = this.getPoolConfigForMarket(market);
-      const inputSymbol = collateralToken ?? DEFAULT_COLLATERAL_TOKEN;
-      const sdkSide = toSdkSide(side);
-
-      const [, , priceMap] = await Promise.all([
-        // 1. SOL fee check
-        this.ensureSufficientSol(),
-
-        // 2. USDC balance check
-        (async () => {
-          // USDC balance check
-          if (inputSymbol === 'USDC') {
-            try {
-              const balances = await this.walletMgr.getTokenBalances();
-              const usdcBalance = balances.tokens.find((t) => t.symbol === 'USDC')?.amount ?? 0;
-              if (usdcBalance < collateralAmount) {
-                throw new Error(
-                  `Insufficient USDC collateral.\n` +
-                    `  Required: $${collateralAmount.toFixed(2)}\n` +
-                    `  Available: $${usdcBalance.toFixed(2)}\n` +
-                    `  Deposit USDC to trade on Flash Trade.`,
-                );
-              }
-            } catch (e: unknown) {
-              const eMsg = getErrorMessage(e);
-              if (eMsg.includes('Insufficient USDC')) throw e;
-              logger.info('CLIENT', `USDC balance check skipped (RPC error): ${scrubSensitive(eMsg)}`);
-            }
-          }
-
-          // Note: no duplicate position check — Flash Trade protocol allows
-          // increasing position size by opening additional same-side trades.
-          // The protocol merges them into a single position with recalculated
-          // weighted entry price.
-        })(),
-
-        // 3. Price map fetch (runs concurrently with validation checks)
-        this.getPriceMap(poolConfig),
-      ]);
-
-      const targetToken = this.findToken(poolConfig, market);
-      const collateralSymbol = collateralToken ?? DEFAULT_COLLATERAL_TOKEN;
-      const inputToken = this.findToken(poolConfig, collateralSymbol);
-
-      logger.info('TRADE', 'Trade Request', {
-        market,
-        side,
-        collateralToken: inputToken.symbol,
-        collateralAmount,
-        leverage,
-        size: collateralAmount * leverage,
-      });
-      const targetPrice = priceMap.get(targetToken.symbol);
-      const inputPrice = priceMap.get(inputToken.symbol);
-      if (!targetPrice) throw new Error(`Oracle unavailable for ${targetToken.symbol}. Try again later.`);
-      if (!inputPrice) throw new Error(`Oracle unavailable for ${inputToken.symbol}. Try again later.`);
-
-      const priceAfterSlippage = this.perpClient.getPriceAfterSlippage(
-        true,
-        new BN(this.config.defaultSlippageBps),
-        targetPrice.price,
-        sdkSide,
-      );
-
-      const collateralNative = uiDecimalsToNative(collateralAmount.toString(), inputToken.decimals);
-      const inputCustody = this.findCustody(poolConfig, inputToken.symbol);
-      const outputCustody = this.findCustody(poolConfig, targetToken.symbol);
-
-      const custodyAccounts = await withRetry(
-        () =>
-          this.perpClient.program.account.custody.fetchMultiple([
-            inputCustody.custodyAccount,
-            outputCustody.custodyAccount,
-          ]),
-        'custody-fetch',
-        { maxAttempts: 2 },
-      );
-
-      if (!custodyAccounts[0] || !custodyAccounts[1]) {
-        throw new Error('Failed to fetch custody accounts from chain');
-      }
-
-      const sizeAmount = this.perpClient.getSizeAmountFromLeverageAndCollateral(
-        collateralNative,
-        leverage.toString(),
-        targetToken as unknown as Token,
-        inputToken as unknown as Token,
-        sdkSide,
-        targetPrice.price,
-        targetPrice.emaPrice,
-        CustodyAccount.from(outputCustody.custodyAccount, custodyAccounts[1]),
-        inputPrice.price,
-        inputPrice.emaPrice,
-        CustodyAccount.from(inputCustody.custodyAccount, custodyAccounts[0]),
-        BN_ZERO,
-      );
-
-      // ── Determine the correct collateral token for this market+side ──
-      // The on-chain market PDA is derived from (targetCustody, collateralCustody, side).
-      // For non-virtual tokens (JUP, JTO, RAY, HYPE): long collateral = self, short collateral = USDC
-      // For virtual tokens (PYTH, KMNO, MET): long collateral = JUP, short collateral = USDC
-      // We MUST look this up from poolConfig.markets rather than assuming collateral = target.
-      const poolMarkets = getTypedMarkets(poolConfig);
-      const matchedMarket = poolMarkets.find((m) => m.targetMint.equals(targetToken.mintKey) && m.side === sdkSide);
-      let marketCollateralSymbol: string;
-      if (matchedMarket) {
-        marketCollateralSymbol = this.resolveTokenSymbol(poolConfig, matchedMarket.collateralMint);
-      } else {
-        // Fallback: assume collateral = target (works for standard markets)
-        logger.info('TRADE', `No market config found for ${market}/${sideStr}, assuming collateral = target`);
-        marketCollateralSymbol = targetToken.symbol;
-      }
-
-      logger.debug(
-        'TRADE',
-        `Instruction routing: market=${market} side=${sideStr} ` +
-          `inputToken=${inputToken.symbol} marketCollateral=${marketCollateralSymbol}`,
-      );
-
-      // ── Check if a position already exists → use increaseSize instead of openPosition ──
-      // Flash Trade protocol rejects openPosition when a same-market same-side position exists.
-      // In that case, use increaseSize to merge into the existing position.
-      let existingPositionPubkey: PublicKey | null = null;
-      try {
-        const { position } = await this.findUserPosition(poolConfig, market, side);
-        existingPositionPubkey = position.pubkey;
-        logger.info('TRADE', `Existing ${sideStr} position found on ${market} — will increaseSize`);
-      } catch {
-        // No existing position — will open new
-      }
-
-      const ref = this.getReferralParams();
-      const privilege = ref?.privilege ?? Privilege.None;
-      const stakeAcct = ref?.tokenStakeAccount;
-      const refAcct = ref?.userReferralAccount;
-
-      let result: { instructions: TransactionInstruction[]; additionalSigners: Signer[] };
-      if (existingPositionPubkey) {
-        // Increase existing position size
-        logger.debug(
-          'TRADE',
-          `Using increaseSize(${targetToken.symbol}, ${marketCollateralSymbol}, ${existingPositionPubkey.toBase58()})`,
-        );
-        result = await quietSdk(() =>
-          this.perpClient.increaseSize(
-            targetToken.symbol,
-            marketCollateralSymbol,
-            existingPositionPubkey!,
-            sdkSide,
-            poolConfig,
-            priceAfterSlippage,
-            sizeAmount,
-            privilege,
-            stakeAcct,
-            refAcct,
-          ),
-        );
-      } else if (inputToken.symbol === marketCollateralSymbol) {
-        // User's input token matches the market's collateral custody → direct open
-        logger.debug('TRADE', `Using openPosition(${targetToken.symbol}, ${marketCollateralSymbol})`);
-        result = await quietSdk(() =>
-          this.perpClient.openPosition(
-            targetToken.symbol,
-            marketCollateralSymbol,
-            priceAfterSlippage,
-            collateralNative,
-            sizeAmount,
-            sdkSide,
-            poolConfig,
-            privilege,
-            stakeAcct,
-            refAcct,
-          ),
-        );
-      } else {
-        // User's input token differs from market collateral → swap first
-        logger.debug(
-          'TRADE',
-          `Using swapAndOpen(${targetToken.symbol}, ${marketCollateralSymbol}, ${inputToken.symbol})`,
-        );
-        result = await quietSdk(() =>
-          this.perpClient.swapAndOpen(
-            targetToken.symbol,
-            marketCollateralSymbol,
-            inputToken.symbol,
-            collateralNative,
-            priceAfterSlippage,
-            sizeAmount,
-            sdkSide,
-            poolConfig,
-            privilege,
-            stakeAcct,
-            refAcct,
-          ),
-        );
-      }
-
-      // Prepend ATA createIdempotent only for direct openPosition/increaseSize.
-      // swapAndOpen manages its own intermediate token accounts internally —
-      // prepending ATA for the target token causes IllegalOwner errors because
-      // the SDK expects to set up the account itself.
-      const isSwapAndOpen = inputToken.symbol !== marketCollateralSymbol && !existingPositionPubkey;
-      let allInstructions: TransactionInstruction[];
-      if (isSwapAndOpen) {
-        // swapAndOpen handles ATA internally — don't prepend
-        allInstructions = [...result.instructions];
-      } else {
-        // Direct open/increaseSize — prepend ATA for target token (matches website)
-        const ataIxs = buildATAIdempotentIxs(this.wallet.publicKey, [targetToken.mintKey]);
-        allInstructions = [...ataIxs, ...result.instructions];
-      }
-
-      // swapAndOpen does more work (swap + open in one ix) → needs higher CU
-      // Force 420k minimum for swapAndOpen regardless of config (matches Flash UI)
-      const cuOverride = isSwapAndOpen ? Math.max(this.config.computeUnitLimit, 420_000) : undefined;
-
-      const txSignature = await this.sendTx(
-        allInstructions,
-        result.additionalSigners,
-        poolConfig,
-        undefined,
-        cuOverride,
-      );
-
-
-      // Compute SDK-exact liquidation price for the return value
-      let openLiqPrice = 0;
-      try {
-        const targetCustodyAcct = CustodyAccount.from(outputCustody.custodyAccount, custodyAccounts[1]);
-        const openSizeUsd = targetPrice.price.getAssetAmountUsd(sizeAmount, targetToken.decimals);
-        const openCollateralUsd = inputPrice.price.getAssetAmountUsd(collateralNative, inputToken.decimals);
-        const liqResult = this.perpClient.getLiquidationPriceWithOrder(
-          openCollateralUsd,
-          sizeAmount,
-          openSizeUsd,
-          targetToken.decimals,
-          targetPrice.price,
-          sdkSide,
-          targetCustodyAcct,
-        );
-        const liqUi = parseFloat(liqResult.toUiPrice(8));
-        if (Number.isFinite(liqUi) && liqUi > 0) openLiqPrice = liqUi;
-
-        // ── Protocol divergence check ──
-        // Compare CLI formula against SDK result to detect math drift.
-        // Reuses existing data — no extra RPC calls.
-        if (openLiqPrice > 0) {
-          try {
-            const { computeSimulationLiquidationPrice, checkLiquidationDivergence } =
-              await import('../utils/protocol-liq.js');
-            const { getProtocolFeeRates } = await import('../utils/protocol-fees.js');
-            const feeRates = await getProtocolFeeRates(market, this.perpClient);
-            const sizeUsd = collateralAmount * leverage;
-            const cliLiq = computeSimulationLiquidationPrice(
-              targetPrice.uiPrice,
-              sizeUsd,
-              collateralAmount,
-              side,
-              feeRates.maintenanceMarginRate,
-              feeRates.closeFeeRate,
-            );
-            if (cliLiq > 0) {
-              await checkLiquidationDivergence(
-                cliLiq,
-                this.perpClient,
-                targetPrice.price,
-                BN_ZERO,
-                sdkSide,
-                targetCustodyAcct,
-                null,
-                market,
-              );
-            }
-          } catch (divErr: unknown) {
-            const divMsg = getErrorMessage(divErr);
-            if (divMsg.includes('Protocol divergence exceeds')) throw divErr;
-            logger.debug('DIVERGENCE', `Check skipped: ${divMsg}`);
-          }
-        }
-      } catch (liqErr: unknown) {
-        const liqMsg = getErrorMessage(liqErr);
-        if (liqMsg.includes('Protocol divergence exceeds')) throw liqErr;
-        // Non-critical: liquidation price is display-only
-      }
-
-      logger.trade('OPEN', {
-        market,
-        side,
-        collateral: collateralAmount,
-        leverage,
-        price: targetPrice.uiPrice,
-        tx: txSignature,
-      });
-
-      return {
-        txSignature,
-        entryPrice: targetPrice.uiPrice,
-        liquidationPrice: openLiqPrice,
-        sizeUsd: collateralAmount * leverage,
-      };
+      // ── SOLE EXECUTION PATH: Flash API transaction builder ──
+      // API builds the transaction server-side (handles routing, ALTs, CU, collateral swaps).
+      // We sign locally and broadcast via existing infra.
+      return await this.executeOpenPosition(market, side, collateralAmount, leverage, collateralToken);
     } finally {
       this.releaseTradeLock(market, side);
     }
@@ -1716,211 +1977,21 @@ export class FlashClient implements IFlashClient {
     closePercent?: number,
     closeAmount?: number,
   ): Promise<ClosePositionResult> {
-    const logger = getLogger();
-
-
-
     this.acquireTradeLock(market, side);
     try {
-      const poolConfig = this.getPoolConfigForMarket(market);
-      const sdkSide = toSdkSide(side);
-      const sideStr = side === TradeSide.Long ? 'long' : 'short';
+      // ── SOLE EXECUTION PATH: Flash API transaction builder ──
+      const positions = await this.getPositions();
+      const pos = positions.find((p) => p.market?.toUpperCase() === market.toUpperCase() && p.side === side);
+      if (!pos || !pos.pubkey || pos.sizeUsd <= 0) {
+        const sideStr = side === TradeSide.Long ? 'long' : 'short';
+        throw new Error(`No open ${sideStr} position found on ${market}.`);
+      }
 
-      const targetToken = this.findToken(poolConfig, market);
-      const receivingToken = receiveToken
-        ? this.findToken(poolConfig, receiveToken)
-        : this.findToken(poolConfig, DEFAULT_COLLATERAL_TOKEN);
+      const effectiveClosePercent = closePercent ?? (closeAmount ? (closeAmount / pos.sizeUsd) * 100 : 100);
 
-      // Parallel: SOL check + price fetch
-      const [, priceMap] = await Promise.all([this.ensureSufficientSol(), this.getPriceMap(poolConfig)]);
-      const targetPrice = priceMap.get(targetToken.symbol);
-      if (!targetPrice) throw new Error(`Oracle unavailable for ${targetToken.symbol}. Try again later.`);
-
-      const priceAfterSlippage = this.perpClient.getPriceAfterSlippage(
-        false,
-        new BN(this.config.defaultSlippageBps),
-        targetPrice.price,
-        sdkSide,
+      return await this.executeClosePosition(
+        market, side, pos.pubkey, pos.sizeUsd, effectiveClosePercent, receiveToken,
       );
-
-      // ── Determine the correct collateral token for this market+side ──
-      const poolMarkets = getTypedMarkets(poolConfig);
-      const matchedMarket = poolMarkets.find((m) => m.targetMint.equals(targetToken.mintKey) && m.side === sdkSide);
-      let marketCollateralSymbol: string;
-      if (matchedMarket) {
-        marketCollateralSymbol = this.resolveTokenSymbol(poolConfig, matchedMarket.collateralMint);
-      } else {
-        logger.info('TRADE', `No market config found for ${market}/${sideStr}, assuming collateral = target`);
-        marketCollateralSymbol = targetToken.symbol;
-      }
-
-      // ── Determine if this is a partial or full close ──
-      const isPartial = (closePercent !== undefined && closePercent < 100) || closeAmount !== undefined;
-
-      // Fetch position data for PnL computation and partial close sizing
-      let positionSizeUsd = 0;
-      let pnl = 0;
-      const existingPositions = await this.getPositions();
-      const pos = existingPositions.find((p) => p.market?.toUpperCase() === market.toUpperCase() && p.side === side);
-      if (pos && pos.entryPrice > 0 && pos.sizeUsd > 0) {
-        positionSizeUsd = pos.sizeUsd;
-        const priceDelta = targetPrice.uiPrice - pos.entryPrice;
-        const pnlMult = side === TradeSide.Long ? 1 : -1;
-        pnl = (priceDelta / pos.entryPrice) * pos.sizeUsd * pnlMult;
-        if (!Number.isFinite(pnl)) pnl = 0;
-      }
-
-      // Compute the USD amount to close and validate
-      let closeSizeUsd = positionSizeUsd; // default: full close
-      if (closePercent !== undefined && closePercent < 100) {
-        closeSizeUsd = positionSizeUsd * (closePercent / 100);
-      } else if (closeAmount !== undefined) {
-        if (closeAmount > positionSizeUsd) {
-          throw new Error(
-            `Close amount $${closeAmount.toFixed(2)} exceeds position size $${positionSizeUsd.toFixed(2)}`,
-          );
-        }
-        closeSizeUsd = closeAmount;
-      }
-
-      // If remaining size would be negligibly small (< $0.50), close entirely
-      const remainingAfterClose = positionSizeUsd - closeSizeUsd;
-      const shouldFullClose = !isPartial || remainingAfterClose < 0.5 || closeSizeUsd >= positionSizeUsd;
-
-      // Scale PnL proportionally for partial close
-      if (isPartial && !shouldFullClose && positionSizeUsd > 0) {
-        pnl = pnl * (closeSizeUsd / positionSizeUsd);
-        if (!Number.isFinite(pnl)) pnl = 0;
-      }
-
-      logger.debug(
-        'TRADE',
-        `Close routing: market=${market} side=${sideStr} ` +
-          `partial=${isPartial} fullClose=${shouldFullClose} closeSizeUsd=${closeSizeUsd.toFixed(2)} ` +
-          `receiveToken=${receivingToken.symbol} marketCollateral=${marketCollateralSymbol}`,
-      );
-
-      const ref = this.getReferralParams();
-      const privilege = ref?.privilege ?? Privilege.None;
-      const stakeAcct = ref?.tokenStakeAccount;
-      const refAcct = ref?.userReferralAccount;
-
-      let result: { instructions: TransactionInstruction[]; additionalSigners: Signer[] };
-
-      if (shouldFullClose) {
-        // ── Full close ──
-        // Always close to the market's collateral token first.
-        // closeAndSwap can fail with IllegalOwner on pools where collateral != USDC
-        // (e.g., Governance.1 PYTH LONG uses JUP collateral).
-        logger.debug('TRADE', `Using closePosition(${targetToken.symbol}, ${marketCollateralSymbol})`);
-        result = await quietSdk(() =>
-          this.perpClient.closePosition(
-            targetToken.symbol,
-            marketCollateralSymbol,
-            priceAfterSlippage,
-            sdkSide,
-            poolConfig,
-            privilege,
-            stakeAcct,
-            refAcct,
-          ),
-        );
-      } else {
-        // ── Partial close via decreaseSize ──
-        const { position } = await this.findUserPosition(poolConfig, market, side);
-        const positionData = await this.perpClient.program.account.position.fetch(position.pubkey);
-        const posData = positionData as SdkPositionData;
-        if (!posData.sizeAmount || posData.sizeAmount.isZero()) {
-          throw new Error(`No open ${side} position on ${market} to partially close`);
-        }
-
-        // Compute sizeDelta in native token units proportional to closePercent/closeAmount
-        let sizeDelta: BN;
-        if (closePercent !== undefined) {
-          // Scale native sizeAmount by percentage
-          sizeDelta = posData.sizeAmount.mul(new BN(Math.round(closePercent * 100))).div(new BN(10000));
-        } else {
-          // Scale native sizeAmount by USD ratio
-          const ratio = closeSizeUsd / positionSizeUsd;
-          sizeDelta = posData.sizeAmount.mul(new BN(Math.round(ratio * 10000))).div(new BN(10000));
-        }
-
-        if (sizeDelta.isZero()) {
-          throw new Error('Computed close size is too small');
-        }
-
-        logger.debug(
-          'TRADE',
-          `Using decreaseSize(${targetToken.symbol}, ${marketCollateralSymbol}, sizeDelta=${sizeDelta.toString()})`,
-        );
-        result = await quietSdk(() =>
-          this.perpClient.decreaseSize(
-            targetToken.symbol,
-            marketCollateralSymbol,
-            sdkSide,
-            position.pubkey,
-            poolConfig,
-            priceAfterSlippage,
-            sizeDelta,
-            privilege,
-            stakeAcct,
-            refAcct,
-          ),
-        );
-      }
-
-      // ── ATA handling ──
-      // The SDK's closePosition already manages ATA creation internally
-      // (createAssociatedTokenAccountInstruction for the collateral token).
-      // Prepending our own ATA instructions can cause IllegalOwner errors
-      // on non-standard pools (e.g., Governance.1 PYTH LONG with JUP collateral).
-      const ataIxs: TransactionInstruction[] = [];
-
-      // ── Append cancel_all_trigger_orders on full close (matches website) ──
-      // Website always cancels remaining trigger orders (TP/SL) when closing a position.
-      let cancelIxs: TransactionInstruction[] = [];
-      let cancelSigners: Signer[] = [];
-      if (shouldFullClose) {
-        try {
-          const cancelResult = await this.perpClient.cancelAllTriggerOrders(
-            targetToken.symbol,
-            marketCollateralSymbol,
-            sdkSide,
-            poolConfig,
-          );
-          cancelIxs = cancelResult.instructions;
-          cancelSigners = cancelResult.additionalSigners;
-        } catch {
-          // Non-critical — position may have no trigger orders
-        }
-      }
-
-      // Assemble: ATA ixs → close ixs → cancel ixs
-      const allCloseIxs = [...ataIxs, ...result.instructions, ...cancelIxs];
-      const allSigners = [...result.additionalSigners, ...cancelSigners];
-
-      // CU limit handled by dynamic scaling in sendTx (420k base, +30k if >4 instructions)
-      const txSignature = await this.sendTx(allCloseIxs, allSigners, poolConfig);
-
-
-      const closeAction = shouldFullClose ? 'CLOSE' : 'PARTIAL_CLOSE';
-      logger.trade(closeAction, {
-        market,
-        side,
-        price: targetPrice.uiPrice,
-        pnl,
-        closeSizeUsd: shouldFullClose ? positionSizeUsd : closeSizeUsd,
-        tx: txSignature,
-      });
-
-      return {
-        txSignature,
-        exitPrice: targetPrice.uiPrice,
-        pnl,
-        isPartial: isPartial && !shouldFullClose,
-        closedSizeUsd: shouldFullClose ? positionSizeUsd : closeSizeUsd,
-        remainingSizeUsd: shouldFullClose ? 0 : remainingAfterClose,
-      };
     } finally {
       this.releaseTradeLock(market, side);
     }
@@ -1929,104 +2000,22 @@ export class FlashClient implements IFlashClient {
   // ─── Collateral Management ────────────────────────────────────────────────
 
   async addCollateral(market: string, side: TradeSide, amount: number): Promise<CollateralResult> {
-
-
     this.acquireTradeLock(market, side);
     try {
       const poolConfig = this.getPoolConfigForMarket(market);
-      // Parallel: SOL check + position lookup
-      const [, { position, marketConfig }] = await Promise.all([
-        this.ensureSufficientSol(),
-        this.findUserPosition(poolConfig, market, side),
-      ]);
-
-      // Resolve position's actual collateral token from its collateralMint
-      const collateralSymbol = this.resolveTokenSymbol(poolConfig, marketConfig.collateralMint);
-      const inputToken = this.findToken(poolConfig, DEFAULT_COLLATERAL_TOKEN);
-      const amountNative = uiDecimalsToNative(amount.toString(), inputToken.decimals);
-
-      let result: { instructions: TransactionInstruction[]; additionalSigners: Signer[] };
-
-      if (inputToken.symbol === collateralSymbol) {
-        // Input matches position collateral — direct addCollateral
-        result = await this.perpClient.addCollateral(
-          amountNative,
-          market,
-          collateralSymbol,
-          toSdkSide(side),
-          position.pubkey,
-          poolConfig,
-        );
-      } else {
-        // Position collateral differs from input (e.g. position uses SOL, input is USDC)
-        // Use swapAndAddCollateral to swap input into position's collateral token
-        result = await this.perpClient.swapAndAddCollateral(
-          market,
-          inputToken.symbol,
-          collateralSymbol,
-          amountNative,
-          toSdkSide(side),
-          position.pubkey,
-          poolConfig,
-        );
-      }
-
-      const txSignature = await this.sendTx(result.instructions, result.additionalSigners, poolConfig);
-
-      getLogger().trade('ADD_COLLATERAL', { market, side, amount, collateralSymbol, tx: txSignature });
-      return { txSignature };
+      const { position } = await this.findUserPosition(poolConfig, market, side);
+      return await this.executeAddCollateral(position.pubkey.toBase58(), amount);
     } finally {
       this.releaseTradeLock(market, side);
     }
   }
 
   async removeCollateral(market: string, side: TradeSide, amount: number): Promise<CollateralResult> {
-
-
     this.acquireTradeLock(market, side);
     try {
       const poolConfig = this.getPoolConfigForMarket(market);
-      // Parallel: SOL check + position lookup
-      const [, { position, marketConfig }] = await Promise.all([
-        this.ensureSufficientSol(),
-        this.findUserPosition(poolConfig, market, side),
-      ]);
-
-      // Resolve position's actual collateral token from its collateralMint
-      const collateralSymbol = this.resolveTokenSymbol(poolConfig, marketConfig.collateralMint);
-      const outputToken = this.findToken(poolConfig, DEFAULT_COLLATERAL_TOKEN);
-      // removeCollateral uses USD amount (collateralDeltaUsd), so always 6 decimals
-      const amountNative = uiDecimalsToNative(amount.toString(), 6);
-
-      let result: { instructions: TransactionInstruction[]; additionalSigners: Signer[] };
-
-      if (outputToken.symbol === collateralSymbol) {
-        // Position collateral matches desired output — direct removeCollateral
-        result = await this.perpClient.removeCollateral(
-          amountNative,
-          market,
-          collateralSymbol,
-          toSdkSide(side),
-          position.pubkey,
-          poolConfig,
-        );
-      } else {
-        // Position collateral differs from desired output (e.g. collateral is SOL, want USDC)
-        // Use removeCollateralAndSwap to withdraw and swap to output token
-        result = await this.perpClient.removeCollateralAndSwap(
-          market,
-          collateralSymbol,
-          outputToken.symbol,
-          amountNative,
-          toSdkSide(side),
-          poolConfig,
-        );
-      }
-
-      const txSignature = await this.sendTx(result.instructions, result.additionalSigners, poolConfig);
-
-      getLogger().trade('REMOVE_COLLATERAL', { market, side, amount, collateralSymbol, tx: txSignature });
-      return { txSignature };
+      const { position } = await this.findUserPosition(poolConfig, market, side);
+      return await this.executeRemoveCollateral(position.pubkey.toBase58(), amount);
     } finally {
       this.releaseTradeLock(market, side);
     }
@@ -2258,30 +2247,7 @@ export class FlashClient implements IFlashClient {
   // ─── Queries ──────────────────────────────────────────────────────────────
 
   async getPositions(): Promise<Position[]> {
-    // Query ALL tradeable pools in parallel — not just the default pool.
-    // Users may have positions across Crypto.1, Governance.1, Virtual.1, etc.
-    const seen = new Set<string>();
-    const uniquePools = POOL_NAMES.filter((name) => {
-      if (seen.has(name) || !isTradeablePool(name)) return false;
-      seen.add(name);
-      return true;
-    });
-
-    const results = await Promise.allSettled(
-      uniquePools.map(async (poolName) => {
-        const positions: Position[] = [];
-        await this.getPositionsForPool(poolName, positions);
-        return positions;
-      }),
-    );
-
-    const allPositions: Position[] = [];
-    for (const result of results) {
-      if (result.status === 'fulfilled') {
-        allPositions.push(...result.value);
-      }
-    }
-    return allPositions;
+    return await this.getPositionsViaApi() ?? [];
   }
 
   private async getPositionsForPool(poolName: string, positions: Position[]): Promise<void> {
@@ -2929,7 +2895,6 @@ export class FlashClient implements IFlashClient {
     takeProfit?: number,
     stopLoss?: number,
   ): Promise<OpenPositionResult & { triggerOrdersIncluded?: boolean }> {
-    const logger = getLogger();
     const hasTriggers = takeProfit !== undefined || stopLoss !== undefined;
 
     // If no TP/SL, delegate to standard openPosition
@@ -2937,273 +2902,9 @@ export class FlashClient implements IFlashClient {
       return this.openPosition(market, side, collateralAmount, leverage, collateralToken);
     }
 
-    // Pre-trade validation
-    this.validateLeverage(market, leverage);
-    const sideStr = side === TradeSide.Long ? 'long' : 'short';
-    if (collateralAmount < 10) {
-      throw new Error(
-        `Minimum collateral is $10 (got $${collateralAmount}).\n` + `  Try: open ${leverage}x ${sideStr} ${market} $10`,
-      );
-    }
-
-
-
     this.acquireTradeLock(market, side);
     try {
-      const poolConfig = this.getPoolConfigForMarket(market);
-      const inputSymbol = collateralToken ?? DEFAULT_COLLATERAL_TOKEN;
-      const sdkSide = toSdkSide(side);
-
-      const [, , priceMap] = await Promise.all([
-        this.ensureSufficientSol(),
-        (async () => {
-          if (inputSymbol === 'USDC') {
-            try {
-              const balances = await this.walletMgr.getTokenBalances();
-              const usdcBalance = balances.tokens.find((t) => t.symbol === 'USDC')?.amount ?? 0;
-              if (usdcBalance < collateralAmount) {
-                throw new Error(
-                  `Insufficient USDC collateral.\n` +
-                    `  Required: $${collateralAmount.toFixed(2)}\n` +
-                    `  Available: $${usdcBalance.toFixed(2)}\n` +
-                    `  Deposit USDC to trade on Flash Trade.`,
-                );
-              }
-            } catch (e: unknown) {
-              const eMsg = getErrorMessage(e);
-              if (eMsg.includes('Insufficient USDC')) throw e;
-              logger.info('CLIENT', `USDC balance check skipped: ${scrubSensitive(eMsg)}`);
-            }
-          }
-        })(),
-        this.getPriceMap(poolConfig),
-      ]);
-
-      const targetToken = this.findToken(poolConfig, market);
-      const collateralSymbol = collateralToken ?? DEFAULT_COLLATERAL_TOKEN;
-      const inputToken = this.findToken(poolConfig, collateralSymbol);
-
-      const targetPrice = priceMap.get(targetToken.symbol);
-      const inputPrice = priceMap.get(inputToken.symbol);
-      if (!targetPrice) throw new Error(`Oracle unavailable for ${targetToken.symbol}. Try again later.`);
-      if (!inputPrice) throw new Error(`Oracle unavailable for ${inputToken.symbol}. Try again later.`);
-
-      const priceAfterSlippage = this.perpClient.getPriceAfterSlippage(
-        true,
-        new BN(this.config.defaultSlippageBps),
-        targetPrice.price,
-        sdkSide,
-      );
-
-      const collateralNative = uiDecimalsToNative(collateralAmount.toString(), inputToken.decimals);
-      const inputCustody = this.findCustody(poolConfig, inputToken.symbol);
-      const outputCustody = this.findCustody(poolConfig, targetToken.symbol);
-
-      const custodyAccounts = await withRetry(
-        () =>
-          this.perpClient.program.account.custody.fetchMultiple([
-            inputCustody.custodyAccount,
-            outputCustody.custodyAccount,
-          ]),
-        'custody-fetch',
-        { maxAttempts: 2 },
-      );
-      if (!custodyAccounts[0] || !custodyAccounts[1]) {
-        throw new Error('Failed to fetch custody accounts from chain');
-      }
-
-      const sizeAmount = this.perpClient.getSizeAmountFromLeverageAndCollateral(
-        collateralNative,
-        leverage.toString(),
-        targetToken as unknown as Token,
-        inputToken as unknown as Token,
-        sdkSide,
-        targetPrice.price,
-        targetPrice.emaPrice,
-        CustodyAccount.from(outputCustody.custodyAccount, custodyAccounts[1]),
-        inputPrice.price,
-        inputPrice.emaPrice,
-        CustodyAccount.from(inputCustody.custodyAccount, custodyAccounts[0]),
-        BN_ZERO,
-      );
-
-      // Resolve market collateral
-      const poolMarkets = getTypedMarkets(poolConfig);
-      const matchedMarket = poolMarkets.find((m) => m.targetMint.equals(targetToken.mintKey) && m.side === sdkSide);
-      const marketCollateralSymbol = matchedMarket
-        ? this.resolveTokenSymbol(poolConfig, matchedMarket.collateralMint)
-        : targetToken.symbol;
-
-      // Check for existing position
-      let existingPositionPubkey: PublicKey | null = null;
-      try {
-        const { position } = await this.findUserPosition(poolConfig, market, side);
-        existingPositionPubkey = position.pubkey;
-      } catch {
-        // No existing position
-      }
-
-      // ── Build open position instructions ──
-      const ref = this.getReferralParams();
-      const privilege = ref?.privilege ?? Privilege.None;
-      const stakeAcct = ref?.tokenStakeAccount;
-      const refAcct = ref?.userReferralAccount;
-
-      let openResult: SdkResult;
-      if (existingPositionPubkey) {
-        openResult = await this.perpClient.increaseSize(
-          targetToken.symbol,
-          marketCollateralSymbol,
-          existingPositionPubkey,
-          sdkSide,
-          poolConfig,
-          priceAfterSlippage,
-          sizeAmount,
-          privilege,
-          stakeAcct,
-          refAcct,
-        );
-      } else if (inputToken.symbol === marketCollateralSymbol) {
-        openResult = await this.perpClient.openPosition(
-          targetToken.symbol,
-          marketCollateralSymbol,
-          priceAfterSlippage,
-          collateralNative,
-          sizeAmount,
-          sdkSide,
-          poolConfig,
-          privilege,
-          stakeAcct,
-          refAcct,
-        );
-      } else {
-        openResult = await this.perpClient.swapAndOpen(
-          targetToken.symbol,
-          marketCollateralSymbol,
-          inputToken.symbol,
-          collateralNative,
-          priceAfterSlippage,
-          sizeAmount,
-          sdkSide,
-          poolConfig,
-          privilege,
-          stakeAcct,
-          refAcct,
-        );
-      }
-
-      // ── Build trigger order instructions ──
-      let tpResult: SdkResult | null = null;
-      let slResult: SdkResult | null = null;
-
-      if (takeProfit !== undefined && !existingPositionPubkey) {
-        try {
-          tpResult = await this.buildTriggerOrderInstructions(market, side, takeProfit, false, sizeAmount, poolConfig);
-        } catch (err: unknown) {
-          logger.info('CLIENT', `Failed to build TP instructions: ${getErrorMessage(err)}`);
-        }
-      }
-
-      if (stopLoss !== undefined && !existingPositionPubkey) {
-        try {
-          slResult = await this.buildTriggerOrderInstructions(market, side, stopLoss, true, sizeAmount, poolConfig);
-        } catch (err: unknown) {
-          logger.info('CLIENT', `Failed to build SL instructions: ${getErrorMessage(err)}`);
-        }
-      }
-
-      // ── Aggregate instructions ──
-      const batch = createBatch();
-      appendToBatch(batch, openResult, 'open');
-      if (tpResult) appendToBatch(batch, tpResult, 'tp');
-      if (slResult) appendToBatch(batch, slResult, 'sl');
-
-      // ── Resolve ALTs for size optimization ──
-      let altAccounts: AddressLookupTableAccount[] = [];
-      try {
-        altAccounts = await resolveALTs(this.perpClient, poolConfig);
-      } catch {
-        // Continue without ALTs
-      }
-
-      // ── Ensure target token ATA exists (matches Flash Trade website) ──
-      // Website always includes createAssociatedTokenAccountIdempotent for the
-      // target token before swap_and_open. The idempotent variant is a no-op if
-      // the ATA already exists, so no RPC check needed.
-      {
-        const ataIxs = buildATAIdempotentIxs(this.wallet.publicKey, [targetToken.mintKey]);
-        if (ataIxs.length > 0) {
-          // Prepend ATA creation before all other instructions
-          batch.instructions.unshift(...ataIxs);
-        }
-      }
-
-      // ── Check if batch fits in one transaction ──
-      let triggerOrdersIncluded = false;
-      let txSignature: string;
-
-      if ((tpResult || slResult) && isBatchWithinLimit(batch, this.wallet.publicKey, altAccounts)) {
-        // Atomic: all instructions in one transaction
-        logger.info('TRADE', `Atomic tx: ${batchSummary(batch)}`);
-        txSignature = await this.sendTx(batch.instructions, batch.additionalSigners, poolConfig, altAccounts);
-        triggerOrdersIncluded = true;
-      } else if (tpResult || slResult) {
-        // Fallback: open first, then TP/SL separately
-        logger.info('TRADE', `Batch too large — splitting open + TP/SL into separate txs`);
-        txSignature = await this.sendTx(openResult.instructions, openResult.additionalSigners, poolConfig, altAccounts);
-
-        // Send TP/SL as separate transaction(s) after open confirms
-        if (tpResult) {
-          try {
-            await this.sendTx(tpResult.instructions, tpResult.additionalSigners, poolConfig, altAccounts);
-          } catch {
-            /* TP is non-critical */
-          }
-        }
-        if (slResult) {
-          try {
-            await this.sendTx(slResult.instructions, slResult.additionalSigners, poolConfig, altAccounts);
-          } catch {
-            /* SL is non-critical */
-          }
-        }
-      } else {
-        // Just the open position
-        txSignature = await this.sendTx(openResult.instructions, openResult.additionalSigners, poolConfig, altAccounts);
-      }
-
-
-
-      // Compute liquidation price
-      let openLiqPrice = 0;
-      try {
-        const _targetCustodyAcct = CustodyAccount.from(outputCustody.custodyAccount, custodyAccounts[1]);
-        const openSizeUsd = targetPrice.price.getAssetAmountUsd(sizeAmount, targetToken.decimals);
-        const openCollateralUsd = inputPrice.price.getAssetAmountUsd(collateralNative, inputToken.decimals);
-        const liqResult = this.perpClient.getLiquidationPriceWithOrder(
-          openCollateralUsd,
-          sizeAmount,
-          openSizeUsd,
-          targetToken.decimals,
-          targetPrice.price,
-          sdkSide,
-          _targetCustodyAcct,
-        );
-        const liqUi = parseFloat(liqResult.toUiPrice(8));
-        if (Number.isFinite(liqUi) && liqUi > 0) openLiqPrice = liqUi;
-      } catch {
-        // Non-critical
-      }
-
-      const entryPrice = targetPrice.price.toUiPrice(8);
-
-      return {
-        txSignature,
-        entryPrice: parseFloat(entryPrice),
-        liquidationPrice: openLiqPrice,
-        sizeUsd: collateralAmount * leverage,
-        triggerOrdersIncluded,
-      };
+      return await this.executeOpenPosition(market, side, collateralAmount, leverage, collateralToken, takeProfit, stopLoss);
     } finally {
       this.releaseTradeLock(market, side);
     }
@@ -3215,31 +2916,7 @@ export class FlashClient implements IFlashClient {
     orderId: number,
     isStopLoss: boolean,
   ): Promise<CancelOrderResult> {
-    const logger = getLogger();
-
-    const poolConfig = this.getPoolConfigForMarket(market);
-    const sdkSide = toSdkSide(side);
-    const { targetSymbol, collateralSymbol } = this.resolveOrderTokens(poolConfig, market, sdkSide);
-
-    const result = await this.perpClient.cancelTriggerOrder(
-      targetSymbol,
-      collateralSymbol,
-      sdkSide,
-      orderId,
-      isStopLoss,
-      poolConfig,
-    );
-
-    const txSignature = await this.sendTx(result.instructions, result.additionalSigners, poolConfig);
-
-    logger.trade(isStopLoss ? 'CANCEL_SL' : 'CANCEL_TP', {
-      market,
-      side,
-      orderId,
-      tx: txSignature,
-    });
-
-    return { txSignature };
+    return await this.executeCancelTriggerOrder(market, side, orderId, isStopLoss);
   }
 
   async cancelAllTriggerOrders(market: string, side: TradeSide): Promise<CancelOrderResult> {

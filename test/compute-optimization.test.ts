@@ -191,10 +191,12 @@ describe('Dynamic CU Scaling', () => {
       'should cap at 600k max');
   });
 
-  it('swapAndOpen forces minimum 420k CU', () => {
+  it('API transaction builder handles CU budgets server-side', () => {
+    // After API-first migration, Flash API transaction builder manages compute units.
+    // The CLI only signs and broadcasts the pre-built transaction.
     const src = readFileSync(resolve(ROOT, 'src/client/flash-client.ts'), 'utf8');
-    assert.ok(src.includes("isSwapAndOpen ? Math.max(this.config.computeUnitLimit, 420_000)"),
-      'swapAndOpen should force at least 420k CU');
+    assert.ok(src.includes('executeOpenPosition'),
+      'openPosition should delegate to API execution');
   });
 });
 
