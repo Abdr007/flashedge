@@ -135,11 +135,11 @@ async function _buildPositionPreview(context: ToolContext, market: string, side:
     const pos = positions.find((p) => p.market.toUpperCase() === market.toUpperCase() && p.side === side);
     if (!pos) return lines;
 
-    lines.push(`  Size:    ${formatUsd(pos.sizeUsd)}`);
-    lines.push(`  Entry:   ${formatPrice(pos.entryPrice)}`);
-    lines.push(`  PnL:     ${colorPnl(pos.unrealizedPnl)}`);
+    lines.push(`  Size:        ${formatUsd(pos.sizeUsd)}`);
+    lines.push(`  Entry:       ${formatPrice(pos.entryPrice)}`);
+    lines.push(`  PnL:         ${colorPnl(pos.unrealizedPnl)}`);
     if (Number.isFinite(pos.liquidationPrice) && pos.liquidationPrice > 0) {
-      lines.push(`  Liq:     ${chalk.yellow(formatPrice(pos.liquidationPrice))}`);
+      lines.push(`  Liq:         ${chalk.yellow(formatPrice(pos.liquidationPrice))}`);
     }
   } catch {
     // Best effort
