@@ -45,6 +45,8 @@ export class SimulatedFlashClient implements IFlashClient {
   private fstats: FStatsClient;
   private livePrices: Map<string, number> = new Map();
   private priceChanges24h: Map<string, number> = new Map();
+  /** M5: Track last primary source prices for fstats deviation check */
+  private _lastPrimaryPrices: Map<string, number> = new Map();
   readonly walletAddress: string;
   /** Trade mutex — prevents concurrent state mutations from corrupting balance/positions */
   private tradeLock: Promise<void> = Promise.resolve();
@@ -99,6 +101,7 @@ export class SimulatedFlashClient implements IFlashClient {
       for (const [sym, tp] of prices) {
         if (tp.price > 0 && Number.isFinite(tp.price)) {
           this.livePrices.set(sym, tp.price);
+          this._lastPrimaryPrices.set(sym, tp.price); // M5: track for deviation check
         }
         if (tp.priceChange24h !== 0) {
           this.priceChanges24h.set(sym, tp.priceChange24h);
@@ -123,7 +126,17 @@ export class SimulatedFlashClient implements IFlashClient {
       }
       for (const [sym, prices] of priceMap) {
         const avg = prices.reduce((a, b) => a + b, 0) / prices.length;
-        if (!this.livePrices.has(sym) || this.livePrices.get(sym) === 0) {
+        const existing = this.livePrices.get(sym);
+        if (!existing || existing === 0) {
+          // M5: Only accept fstats price if we have no primary, or if it's within 10% of last known
+          const lastKnown = this._lastPrimaryPrices.get(sym);
+          if (lastKnown && lastKnown > 0) {
+            const deviation = Math.abs(avg - lastKnown) / lastKnown;
+            if (deviation > 0.10) {
+              logger.warn('SIM', `fstats price for ${sym} ($${avg.toFixed(2)}) deviates ${(deviation * 100).toFixed(1)}% from last primary ($${lastKnown.toFixed(2)}) — skipped`);
+              continue;
+            }
+          }
           this.livePrices.set(sym, avg);
         }
       }
