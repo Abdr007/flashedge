@@ -32,11 +32,11 @@ function getSlippageBps(market: string): number {
 }
 
 // Feed IDs are centralized in PriceService (src/data/prices.ts).
-// Simulation delegates all price fetching to PriceService (Pyth Hermes).
+// Simulation delegates all price fetching to PriceService (Flash API).
 
 /**
  * SimulatedFlashClient implements IFlashClient for paper trading.
- * Uses Pyth Hermes as price source (same oracle as Flash Trade on-chain).
+ * Uses Flash API as price source (same data as Flash Trade on-chain).
  * No real transactions are ever submitted.
  */
 export class SimulatedFlashClient implements IFlashClient {
@@ -93,7 +93,7 @@ export class SimulatedFlashClient implements IFlashClient {
       }
     }
 
-    // ── PRIMARY: PriceService (Pyth Hermes) — same oracle Flash Trade uses on-chain ──
+    // ── PRIMARY: PriceService (Flash API) — authoritative price source ──
     try {
       const { getAllMarkets } = await import('../config/index.js');
       const symbols = getAllMarkets();

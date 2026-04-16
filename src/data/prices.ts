@@ -297,7 +297,7 @@ export class PriceService {
    *   3. Compute: ((current - historical) / historical) * 100
    *   4. Return NaN if insufficient history (callers render as "N/A")
    *
-   * Data source: Pyth Hermes only — no external price APIs.
+   * Data source: Flash API only — no external price APIs.
    */
   private compute24hChange(symbol: string, currentPrice: number): number {
     const history = _sharedHistory.get(symbol);

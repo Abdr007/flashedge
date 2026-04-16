@@ -4,7 +4,7 @@
  * Professional market/position/liquidation/protocol monitoring with threshold-based
  * change detection. Only emits events when meaningful state changes occur.
  *
- * Data sources: Pyth Hermes (prices), fstats API (OI, whales), Flash SDK (positions),
+ * Data sources: Flash API (prices), fstats API (OI, whales), Flash SDK (positions),
  * Solana RPC (latency, slots). No synthetic signals.
  */
 

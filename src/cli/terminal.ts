@@ -3074,7 +3074,7 @@ export class FlashTerminal {
    *   6. Exit cleanly on 'q'
    *
    * Data sources:
-   *   Prices:        Pyth Hermes (same oracle as Flash protocol)
+   *   Prices:        Flash API (authoritative price source)
    *   Open Interest:  fstats API (aggregated Flash protocol state)
    */
   private async handleMarketMonitor(filterMarket?: string): Promise<void> {
@@ -3094,7 +3094,7 @@ export class FlashTerminal {
    *
    * Data sources:
    *   Position data:      Flash SDK perpClient.getUserPositions()
-   *   Price data:         Pyth Hermes oracle (same as Flash protocol)
+   *   Price data:         Flash API (authoritative price source)
    *   Liquidation math:   Flash SDK getLiquidationPriceContractHelper()
    *   Fees/margin:        Flash SDK CustodyAccount (on-chain)
    *   Leverage limits:    Flash SDK PoolConfig MarketConfig

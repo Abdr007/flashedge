@@ -113,22 +113,22 @@ export const protocolStatusTool: ToolDefinition = {
       lines.push(`  RPC Slot:      ${chalk.red('error')}`);
     }
 
-    // 3. Oracle Health — ping Pyth Hermes with latency measurement
+    // 3. Flash API Health — ping Flash API /prices with latency measurement
     try {
       const oracleStart = performance.now();
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 5_000);
       const resp = await fetch(
-        'https://hermes.pyth.network/api/latest_vaas?ids[]=0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d',
+        `${process.env.FLASH_API_URL || 'https://flashapi.trade'}/prices`,
         {
           signal: controller.signal,
         },
       );
       clearTimeout(timer);
       const oracleMs = Math.round(performance.now() - oracleStart);
-      lines.push(`  Oracle Health: ${resp.ok ? chalk.green(`OK (${oracleMs}ms)`) : chalk.red(`HTTP ${resp.status}`)}`);
+      lines.push(`  Flash API:     ${resp.ok ? chalk.green(`OK (${oracleMs}ms)`) : chalk.red(`HTTP ${resp.status}`)}`);
     } catch {
-      lines.push(`  Oracle Health: ${chalk.red('unreachable')}`);
+      lines.push(`  Flash API:     ${chalk.red('unreachable')}`);
     }
 
     // 4. SDK Connection
@@ -606,7 +606,7 @@ export const liquidationMapTool: ToolDefinition = {
         }
       }
 
-      lines.push(theme.dim('  Source: Pyth Hermes (price) | fstats (OI, whale positions)'));
+      lines.push(theme.dim('  Source: Flash API (prices) | fstats (OI, whale positions)'));
       lines.push('');
 
       return { success: true, message: lines.join('\n') };

@@ -478,47 +478,13 @@ export async function sourceVerify(deps: ProtocolViewDeps, market: string): Prom
 
     const priceData = await priceSvc.getPrice(upper);
     if (priceData && Number.isFinite(priceData.price) && priceData.price > 0) {
-      // Fetch raw Pyth data for confidence interval
-      let confidence = 'N/A';
-      let publishSlot = 'N/A';
-      const { getPythFeedId } = await import('../data/prices.js');
-      const feedId = getPythFeedId(upper) ?? 'N/A';
-
-      try {
-        if (feedId === 'N/A') throw new Error('No feed ID');
-        const rawUrl = `https://hermes.pyth.network/v2/updates/price/latest?ids[]=${encodeURIComponent(feedId)}&parsed=true`;
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 5000);
-        try {
-          const res = await fetch(rawUrl, { signal: controller.signal, headers: { Accept: 'application/json' } });
-          if (res.ok) {
-            const raw = (await res.json()) as {
-              parsed?: Array<{ price: { price: string; expo: number; publish_time: number; conf: string } }>;
-            };
-            const entry = raw.parsed?.[0];
-            if (entry) {
-              const price = parseInt(entry.price.price, 10) * Math.pow(10, entry.price.expo);
-              const conf = parseInt(entry.price.conf ?? '0', 10) * Math.pow(10, entry.price.expo);
-              if (Number.isFinite(price) && price > 0 && Number.isFinite(conf)) {
-                confidence = `${((conf / price) * 100).toFixed(4)}%`;
-              }
-              publishSlot = entry.price.publish_time ? String(entry.price.publish_time) : 'N/A';
-            }
-          }
-        } finally {
-          clearTimeout(timeout);
-        }
-      } catch {
-        // Raw fetch failed — non-critical
-      }
-
-      console.log(theme.pair('Oracle', 'Pyth Hermes'));
+      console.log(theme.pair('Source', 'Flash API'));
       console.log(theme.pair('Feed', `${upper}/USD`));
       console.log(theme.pair('Price', `$${priceData.price.toFixed(4)}`));
-      console.log(theme.pair('Publish Time', publishSlot));
-      console.log(theme.pair('Confidence', confidence));
-      console.log(theme.pair('Endpoint', 'hermes.pyth.network'));
-      checks.push('Oracle price verified');
+      console.log(theme.pair('Timestamp', new Date(priceData.timestamp).toISOString()));
+      console.log(theme.pair('Endpoint', 'flashapi.trade/prices'));
+      console.log(theme.pair('Fallback', priceData.isFallback ? theme.warning('Stale cache') : theme.positive('Live')));
+      checks.push('Flash API price verified');
     } else {
       console.log(chalk.red(`  Failed to fetch price for ${upper}`));
       allOk = false;
@@ -1056,7 +1022,7 @@ export async function positionDebug(deps: ProtocolViewDeps, market: string): Pro
 
   // ─── 8. Data source labels ──────────────────────────────────────
   lines.push(`  ${sep(44)}`);
-  lines.push(dim(`  Price Source:       Pyth Hermes`));
+  lines.push(dim(`  Price Source:       Flash API`));
   const sdkLabel = canUseSDK
     ? ' (on-chain CustodyAccount + getLiquidationPriceContractHelper)'
     : protocolParamsAvailable

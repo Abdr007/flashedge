@@ -469,7 +469,7 @@ export async function runMarketMonitor(deps: MarketMonitorDeps, filterMarket?: s
 
     // Footer
     lines.push(`  ${theme.separator(72)}`);
-    lines.push(theme.dim(`  Source: Pyth Hermes (oracle) | fstats (open interest)`));
+    lines.push(theme.dim(`  Source: Flash API (prices) | fstats (open interest)`));
 
     return lines;
   };

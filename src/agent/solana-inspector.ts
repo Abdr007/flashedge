@@ -94,7 +94,7 @@ export class SolanaInspector {
         // OI enrichment is best-effort — market data still valid without it
       }
 
-      // Enrich with 24h price change from Pyth Hermes
+      // Enrich with 24h price change from Flash API
       // (FlashClient.getMarketData() returns priceChange24h: 0)
       try {
         const symbols = data.map((m) => m.symbol);
