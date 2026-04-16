@@ -1,7 +1,7 @@
 import { Connection, type Commitment } from '@solana/web3.js';
 
-/** RPC timeout for regular queries (120s — must exceed confirm timeout to avoid killing confirmTransaction). */
-const RPC_FETCH_TIMEOUT_MS = 120_000;
+/** RPC timeout for regular queries — fail fast so the terminal stays responsive. */
+const RPC_QUERY_TIMEOUT_MS = 10_000;
 
 /** Timeout for transaction confirmation (90s — blockhash validity window). */
 const TX_CONFIRM_TIMEOUT_MS = 90_000;
@@ -54,7 +54,12 @@ export function createConnection(rpcUrl: string, config?: { commitment?: Commitm
     confirmTransactionInitialTimeout: TX_CONFIRM_TIMEOUT_MS,
     wsEndpoint,
     fetch: async (url, options) => {
-      const res = await fetch(url, { ...options, signal: AbortSignal.timeout(RPC_FETCH_TIMEOUT_MS) });
+      // Use short timeout for queries. Transaction sends (sendTransaction/sendRawTransaction)
+      // use their own timeout via UltraTxEngine — this only affects getAccountInfo, getSlot, etc.
+      const isConfirmRequest = typeof options?.body === 'string' &&
+        (options.body.includes('"confirmTransaction"') || options.body.includes('"sendTransaction"') || options.body.includes('"sendRawTransaction"'));
+      const timeoutMs = isConfirmRequest ? TX_CONFIRM_TIMEOUT_MS : RPC_QUERY_TIMEOUT_MS;
+      const res = await fetch(url, { ...options, signal: AbortSignal.timeout(timeoutMs) });
       // M16: Guard against oversized RPC responses (2MB limit)
       const contentLen = res.headers.get('content-length');
       if (contentLen && parseInt(contentLen, 10) > 2_097_152) {

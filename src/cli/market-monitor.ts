@@ -175,9 +175,11 @@ export async function runMarketMonitor(deps: MarketMonitorDeps, filterMarket?: s
       deps.fstats.getOpenInterest().catch(() => ({ markets: [] })),
     ]);
 
-    // Fallback: for markets missing from Pyth (e.g. Lazer-only), read on-chain internal oracle
-    if (deps.rpcManager) {
+    // Fallback: for markets missing from Flash API (e.g. Lazer-only), read on-chain internal oracle
+    // Use a tight timeout — never block the monitor refresh loop
+    if (deps.rpcManager && !deps.rpcManager.allEndpointsDown) {
       const missingSymbols = allSymbols.filter((s) => !priceMap.has(s));
+      const ORACLE_FALLBACK_TIMEOUT_MS = 3_000;
       for (const sym of missingSymbols) {
         try {
           const { PoolConfig } = await import('flash-sdk');
@@ -187,7 +189,10 @@ export async function runMarketMonitor(deps: MarketMonitorDeps, filterMarket?: s
           const pc = PoolConfig.fromIdsByName(poolName, 'mainnet-beta');
           const custody = pc.custodies.find((c: { symbol: string }) => c.symbol === sym);
           if (!custody?.intOracleAccount) continue;
-          const info = await deps.rpcManager.connection.getAccountInfo(custody.intOracleAccount);
+          const info = await Promise.race([
+            deps.rpcManager.connection.getAccountInfo(custody.intOracleAccount),
+            new Promise<null>((resolve) => setTimeout(() => resolve(null), ORACLE_FALLBACK_TIMEOUT_MS)),
+          ]);
           if (!info || info.data.length < 28) continue;
           const rawPrice = info.data.readBigInt64LE(8);
           const exponent = info.data.readInt32LE(16);
@@ -513,7 +518,11 @@ export async function runMarketMonitor(deps: MarketMonitorDeps, filterMarket?: s
     if (!running || refreshInProgress) return;
     refreshInProgress = true;
     try {
-      const rows = await fetchData();
+      // Never block the refresh loop longer than 8s — fail fast to keep TUI responsive
+      const rows = await Promise.race([
+        fetchData(),
+        new Promise<MarketRow[]>((_, reject) => setTimeout(() => reject(new Error('refresh timeout')), 8_000)),
+      ]);
       if (!running) return;
       const renderStart = performance.now();
       const frame = buildFrame(rows);
