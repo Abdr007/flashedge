@@ -2442,6 +2442,18 @@ export class FlashTerminal {
     } else if (lower === 'protocol verify' || lower === 'verify protocol' || lower === 'verify') {
       await this.handleProtocolVerify();
       return;
+    } else if (lower.startsWith('protocol verify ') || lower.startsWith('verify protocol ')) {
+      // "protocol verify SOL" → route to source verify for per-market verification
+      const rawMarket = lower.startsWith('protocol verify ')
+        ? lower.slice('protocol verify '.length).trim()
+        : lower.slice('verify protocol '.length).trim();
+      if (rawMarket) {
+        const market = resolveMarket(rawMarket.toUpperCase());
+        await this.handleSourceVerify(market);
+      } else {
+        await this.handleProtocolVerify();
+      }
+      return;
     } else if (
       lower.startsWith('inspect market ') ||
       (lower.startsWith('inspect ') &&
