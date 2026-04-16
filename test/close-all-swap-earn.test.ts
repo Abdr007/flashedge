@@ -63,10 +63,10 @@ describe('Close All parsing', () => {
     expect(result!.action).toBe(ActionType.CloseAll);
   });
 
-  it('parses "ca" alias', () => {
+  // C7 safety: "ca" alias removed to prevent accidental close-all from typo
+  it('"ca" alias removed for safety', () => {
     const result = localParse('ca');
-    expect(result).toBeDefined();
-    expect(result!.action).toBe(ActionType.CloseAll);
+    expect(result).toBeNull();
   });
 });
 

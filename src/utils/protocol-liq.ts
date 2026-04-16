@@ -206,8 +206,8 @@ export function computeSimulationLiquidationPrice(
   const availableCollateral = collateralUsd - maintenanceMargin - exitFee - unsettledFeesUsd;
 
   if (availableCollateral <= 0) {
-    // Position is at or beyond liquidation
-    return entryPrice;
+    // M25: Position is at or beyond liquidation — return 0 as sentinel
+    return 0;
   }
 
   // Price distance to liquidation

@@ -73,10 +73,10 @@ describe('computeSimulationLiquidationPrice', () => {
     expect(computeSimulationLiquidationPrice(150, 500, -100, TradeSide.Long)).toBe(0);
   });
 
-  it('returns entry price when collateral insufficient for margin', () => {
+  it('returns 0 when collateral insufficient for margin (M25)', () => {
     // Collateral $1, size $500 — maintenance margin alone ($5) exceeds collateral
     const liqPrice = computeSimulationLiquidationPrice(150, 500, 1, TradeSide.Long, 0.01, 0.0008);
-    expect(liqPrice).toBe(150); // at or beyond liquidation
+    expect(liqPrice).toBe(0); // M25: sentinel value for already-liquidated positions
   });
 
   it('handles zero maintenance margin rate gracefully', () => {

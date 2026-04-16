@@ -51,8 +51,8 @@ export function validateRpcUrl(url: string): string {
   try {
     parsed = new URL(url);
   } catch {
-    // If URL is unparseable, let it fail later at connection time
-    return url;
+    // H13: Reject unparseable URLs — prevents SSRF protection bypass
+    throw new Error(`Invalid RPC URL: "${url}" is not a valid URL.`);
   }
 
   const isLocal = parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1' || parsed.hostname === '[::1]';
@@ -246,7 +246,8 @@ export function loadConfig(): FlashConfig {
 }
 
 // ─── Default Referrer ─────────────────────────────────────────────────────────
-// All CLI trades are referred by this wallet. Earns rebates on every trade.
+// M9: Flash Trade default referrer. Overridable via REFERRER_ADDRESS env var or config.
+// All CLI trades include this referral unless overridden.
 export const DEFAULT_REFERRER_ADDRESS = 'Dvvzg9rwaNfUqBSscoMZJa5CHFv8Lm94ngZrRyLGLfmK';
 
 // Flash program constants
@@ -447,7 +448,7 @@ export function refreshLeverageCache(): void {
 export function getMaxLeverage(market: string, degenMode = false): number {
   const upper = market.toUpperCase();
   const lev = loadSdkLeverage()[upper];
-  if (!lev) return 100; // safe default for unknown markets
+  if (!lev) return 10; // L7: conservative default for unknown markets
   return degenMode ? lev.degenMaxLev : lev.maxLev;
 }
 

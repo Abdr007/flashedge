@@ -71,6 +71,10 @@ export function setAlias(shortcut: string, expansion: string): boolean {
   if (!/^[a-z0-9_-]+$/.test(key)) return false;
   if (key.length > 50) return false;
   if (RESERVED.has(key)) return false;
+  // M11: Validate expansion value — no control chars, max 200 chars
+  if (expansion.length > 200) return false;
+  // eslint-disable-next-line no-control-regex
+  if (/[\x00-\x1f\x7f]/.test(expansion)) return false;
   aliases[key] = expansion;
   saveAliases(aliases);
   return true;

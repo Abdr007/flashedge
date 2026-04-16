@@ -13,13 +13,16 @@ export const swapTool: ToolDefinition = {
     inputToken: z.string().max(20),
     outputToken: z.string().max(20),
     amount: z.number().positive(),
+    slippage: z.number().min(0.01).max(50).optional(), // M24: slippage tolerance in percent
   }),
   execute: async (params, context): Promise<ToolResult> => {
-    const { inputToken, outputToken, amount } = params as {
+    const { inputToken, outputToken, amount, slippage } = params as {
       inputToken: string;
       outputToken: string;
       amount: number;
+      slippage?: number;
     };
+    const slippageBps = Math.round((slippage ?? 1) * 100); // default 1% slippage
 
     if (inputToken.toUpperCase() === outputToken.toUpperCase()) {
       return { success: false, message: chalk.red('  Input and output tokens must be different.') };
@@ -38,7 +41,7 @@ export const swapTool: ToolDefinition = {
     }
 
     try {
-      const result = await client.swap(inputToken.toUpperCase(), outputToken.toUpperCase(), amount);
+      const result = await client.swap(inputToken.toUpperCase(), outputToken.toUpperCase(), amount, slippageBps);
 
       const lines = [
         '',

@@ -49,10 +49,14 @@ export function computeMomentumSignal({ market, volume }: MomentumInput): Strate
   } else if (priceUp && volumeUp) {
     signal = 'bullish';
     confidence = Math.min(0.85, 0.5 + Math.abs(volumeGrowth) * 0.5);
+    // Extremely high volume growth (>500%) may indicate manipulation — reduce confidence
+    if (Math.abs(volumeGrowth) > 5) confidence *= 0.7;
     reasoning = `Price rising (+${safePriceChange.toFixed(2)}%) with increasing volume (+${(volumeGrowth * 100).toFixed(1)}%). Strong upward momentum.`;
   } else if (priceDown && volumeUp) {
     signal = 'bearish';
     confidence = Math.min(0.8, 0.5 + Math.abs(volumeGrowth) * 0.4);
+    // Extremely high volume growth (>500%) may indicate manipulation — reduce confidence
+    if (Math.abs(volumeGrowth) > 5) confidence *= 0.7;
     reasoning = `Price falling (${safePriceChange.toFixed(2)}%) with increasing volume (+${(volumeGrowth * 100).toFixed(1)}%). Selling pressure intensifying.`;
   } else if (priceUp && volumeDown) {
     signal = 'neutral';

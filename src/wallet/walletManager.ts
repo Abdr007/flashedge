@@ -22,6 +22,9 @@ export class WalletManager {
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
   private static readonly SESSION_TIMEOUT_MS = safeEnvNumber('SESSION_TIMEOUT_MS', 900_000); // 15 min default
 
+  // H10: Disconnecting flag — prevents signing with a zeroed keypair during disconnect
+  private _disconnecting = false;
+
   constructor(connection: Connection) {
     this.connection = connection;
   }
@@ -72,7 +75,13 @@ export class WalletManager {
   }
 
   getKeypair(): Keypair | null {
+    if (this._disconnecting) return null; // H10: prevent use during disconnect
     return this.keypair;
+  }
+
+  /** H10: Check if wallet is currently disconnecting */
+  isDisconnecting(): boolean {
+    return this._disconnecting;
   }
 
   /**
@@ -82,6 +91,7 @@ export class WalletManager {
    * so we zero the secretKey property directly to scrub from memory.
    */
   disconnect(): void {
+    this._disconnecting = true;
     if (this.keypair) {
       // Zero the secret key bytes in memory
       // Keypair.secretKey returns the internal Uint8Array reference
@@ -96,6 +106,7 @@ export class WalletManager {
     }
     this.keypair = null;
     this.publicKey = null;
+    this._disconnecting = false;
     this.tokenBalancesCache = null;
     if (this.idleTimer) {
       clearTimeout(this.idleTimer);

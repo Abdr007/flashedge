@@ -166,9 +166,12 @@ export function buildLiveTradeWarnings(market: string, leverage: number, collate
   if (leverage >= 20) warnings.push(`High leverage (${leverage}x) — liquidation risk is significant`);
   if (leverage >= 50) warnings.push('Extreme leverage — small price moves can liquidate');
 
-  const liqDistance = (1 / leverage) * 100;
-  if (liqDistance < 5) {
-    warnings.push(`Liquidation within ${liqDistance.toFixed(1)}% price move`);
+  // H18: Account for maintenance margin (1%) and close fee (0.08%) in liq distance estimate
+  const liqDistance = (1 / leverage - 0.01 - 0.0008) * 100;
+  if (liqDistance <= 0) {
+    warnings.push('CRITICAL: Position may be liquidatable immediately after fees/margin');
+  } else if (liqDistance < 5) {
+    warnings.push(`Liquidation within ${liqDistance.toFixed(1)}% price move (after fees/margin)`);
   }
 
   if (collateral !== undefined && collateral > 1000) {

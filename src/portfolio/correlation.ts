@@ -3,7 +3,9 @@
  * Prevents stacking trades in correlated markets.
  */
 
-// Correlation groups: markets within the same group are considered correlated
+// Correlation groups: markets within the same group are considered correlated.
+// NOTE: New markets must be manually added to the appropriate group below.
+// Markets not listed here are treated as uncorrelated (group index -1).
 const CORRELATION_GROUPS: string[][] = [
   ['SOL', 'JTO', 'JUP', 'PYTH', 'RAY', 'BONK', 'WIF', 'PENGU', 'PUMP'], // Solana ecosystem
   ['BTC'], // Bitcoin

@@ -49,7 +49,7 @@ export interface TradeLimitCheck {
 
 export interface SigningAuditEntry {
   timestamp: string;
-  type: 'open' | 'close' | 'partial_close' | 'add_collateral' | 'remove_collateral';
+  type: 'open' | 'close' | 'partial_close' | 'add_collateral' | 'remove_collateral' | 'reverse';
   market: string;
   side?: string;
   collateral?: number;
@@ -253,7 +253,11 @@ export class SigningGuard {
 let _guard: SigningGuard | null = null;
 
 export function initSigningGuard(config?: Partial<SigningGuardConfig>): SigningGuard {
-  if (_guard) return _guard;
+  // M6: Update config on re-init instead of silently returning stale guard
+  if (_guard) {
+    if (config) _guard = new SigningGuard(config);
+    return _guard;
+  }
   _guard = new SigningGuard(config);
   return _guard;
 }

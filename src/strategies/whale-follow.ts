@@ -55,7 +55,10 @@ export function computeWhaleFollowSignal({
   const dedupedWhales: WhaleActivity[] = [];
 
   for (const a of [...whaleActivity, ...whalePositions]) {
-    const key = `${a.market}:${a.side}:${a.sizeUsd}`;
+    // Dedup key includes wallet/account if available, plus timestamp as fallback
+    const aAny = a as unknown as Record<string, unknown>;
+    const wallet = aAny.address ?? aAny.owner ?? '';
+    const key = `${a.market}:${a.side}:${a.sizeUsd}:${wallet || a.timestamp}`;
     if (!seen.has(key)) {
       seen.add(key);
       dedupedWhales.push(a);

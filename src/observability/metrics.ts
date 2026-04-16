@@ -36,21 +36,26 @@ export interface HistogramSnapshot {
 const MAX_HISTOGRAM_SAMPLES = 1000;
 
 class Histogram {
-  private samples: number[] = [];
+  private samples: number[] = new Array(MAX_HISTOGRAM_SAMPLES);
+  private _index = 0;
+  private _count = 0;
 
   record(value: number): void {
     if (!Number.isFinite(value)) return;
-    this.samples.push(value);
-    if (this.samples.length > MAX_HISTOGRAM_SAMPLES) {
-      this.samples = this.samples.slice(-MAX_HISTOGRAM_SAMPLES);
-    }
+    this.samples[this._index % MAX_HISTOGRAM_SAMPLES] = value;
+    this._index++;
+    if (this._count < MAX_HISTOGRAM_SAMPLES) this._count++;
   }
 
   snapshot(): HistogramSnapshot {
-    if (this.samples.length === 0) {
+    if (this._count === 0) {
       return { count: 0, sum: 0, min: 0, max: 0, avg: 0, p50: 0, p95: 0, p99: 0 };
     }
-    const sorted = [...this.samples].sort((a, b) => a - b);
+    // Extract only the valid portion of the ring buffer
+    const valid = this._count < MAX_HISTOGRAM_SAMPLES
+      ? this.samples.slice(0, this._count)
+      : [...this.samples];
+    const sorted = valid.sort((a, b) => a - b);
     const sum = sorted.reduce((s, v) => s + v, 0);
     return {
       count: sorted.length,
@@ -65,7 +70,9 @@ class Histogram {
   }
 
   reset(): void {
-    this.samples = [];
+    this.samples = new Array(MAX_HISTOGRAM_SAMPLES);
+    this._index = 0;
+    this._count = 0;
   }
 }
 

@@ -13,7 +13,7 @@
  */
 
 import { Connection } from '@solana/web3.js';
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
 import { getPoolRegistry } from './pool-registry.js';
@@ -49,10 +49,17 @@ const SNAPSHOT_FILE = join(homedir(), '.flash', 'flp-snapshots.json');
 const SNAPSHOT_INTERVAL_MS = 3600_000; // Save at most once per hour
 const MAX_SNAPSHOTS = 168; // 7 days of hourly snapshots
 
+const MAX_SNAPSHOT_FILE_BYTES = 5 * 1024 * 1024; // 5MB
+
 function loadSnapshots(): FlpSnapshot[] {
   try {
     if (!existsSync(SNAPSHOT_FILE)) return [];
-    const data = JSON.parse(readFileSync(SNAPSHOT_FILE, 'utf8'));
+    const raw = readFileSync(SNAPSHOT_FILE, 'utf8');
+    if (raw.length > MAX_SNAPSHOT_FILE_BYTES) {
+      getLogger().warn('EARN', `Snapshot file too large (${raw.length} bytes), starting fresh`);
+      return [];
+    }
+    const data = JSON.parse(raw);
     return Array.isArray(data) ? data : [];
   } catch {
     return [];
@@ -63,7 +70,10 @@ function saveSnapshots(snapshots: FlpSnapshot[]): void {
   try {
     const dir = join(homedir(), '.flash');
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
-    writeFileSync(SNAPSHOT_FILE, JSON.stringify(snapshots), { mode: 0o600 });
+    // Atomic write: tmp file + rename to prevent corruption on crash
+    const tmpFile = SNAPSHOT_FILE + '.tmp';
+    writeFileSync(tmpFile, JSON.stringify(snapshots), { mode: 0o600 });
+    renameSync(tmpFile, SNAPSHOT_FILE);
   } catch {
     /* non-critical */
   }

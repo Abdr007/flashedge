@@ -73,8 +73,14 @@ export async function checkApiHealth(): Promise<HealthStatus> {
     }
   }
 
-  // COLD PATH: must block and check
-  return _performHealthCheck();
+  // COLD PATH: must block and check — M7: timeout to prevent blocking trade execution
+  const HEALTH_CHECK_TIMEOUT_MS = 5_000;
+  return Promise.race([
+    _performHealthCheck(),
+    new Promise<HealthStatus>((_, reject) =>
+      setTimeout(() => reject(new Error('Health check timed out')), HEALTH_CHECK_TIMEOUT_MS),
+    ),
+  ]);
 }
 
 /** Clear cached health status (used in testing or after network changes). */

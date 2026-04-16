@@ -252,6 +252,11 @@ export class SimulatedFlashClient implements IFlashClient {
       existing.leverage = Number.isFinite(mergedLev) && mergedLev > 0 ? mergedLev : leverage;
       existing.entryPrice = finalEntryPrice;
       existing.openFee += openFee;
+      // LOW: Recalculate liquidation price after merge
+      existing.liquidationPrice = computeSimulationLiquidationPrice(
+        existing.entryPrice, existing.sizeUsd, existing.collateralUsd,
+        existing.side, feeRates.maintenanceMarginRate, feeRates.closeFeeRate,
+      );
       txSig = `SIM_ADD_${existing.id}`;
     } else {
       const position: SimulatedPosition = {
@@ -332,6 +337,8 @@ export class SimulatedFlashClient implements IFlashClient {
       }
       closeFraction = closeAmount / position.sizeUsd;
     }
+    // LOW: Snap near-full closes to 1 to avoid float precision issues
+    if (closeFraction >= 0.999) closeFraction = 1;
 
     // If remaining would be tiny (< $0.50), close fully
     const remainingSize = position.sizeUsd * (1 - closeFraction);
@@ -540,8 +547,8 @@ export class SimulatedFlashClient implements IFlashClient {
 
   async getPositions(): Promise<Position[]> {
     await this.refreshPrices();
-    // Check TP/SL triggers before returning positions
-    await this.checkTpSlTriggers();
+    // H4: Check TP/SL triggers under trade lock to prevent concurrent close corruption
+    await this.withTradeLock(() => this.checkTpSlTriggers());
     return this.state.positions.map((p) => {
       const currentPrice = this.livePrices.get(p.market) ?? p.entryPrice;
       const priceDelta = currentPrice - p.entryPrice;

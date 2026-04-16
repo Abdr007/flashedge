@@ -159,6 +159,8 @@ export const fafStakeTool: ToolDefinition = {
     }
 
     try {
+      // Note: Math.floor(amount * 10^decimals) can lose precision for very large amounts
+      // due to floating-point representation limits. Current FAF trade sizes are safe.
       const nativeAmount = BigInt(Math.floor(amount * Math.pow(10, FAF_DECIMALS)));
       const BN = (await import('bn.js')).default;
       const result = await perpClient.depositTokenStake(userPk, userPk, new BN(nativeAmount.toString()), poolConfig);

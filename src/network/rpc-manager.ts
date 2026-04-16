@@ -671,6 +671,9 @@ export class RpcManager {
    * Get connections that are within slot consensus (< 3 slot divergence from median).
    * Used by broadcast to exclude stale endpoints.
    */
+  // M12: Cache non-active connections to prevent socket leaks
+  private _connectionCache = new Map<string, Connection>();
+
   getConsensusHealthyConnections(): Connection[] {
     const consensus = this.getSlotConsensus();
     if (consensus.medianSlot === 0) {
@@ -684,17 +687,21 @@ export class RpcManager {
         if (ep.url === this.activeEndpoint.url) {
           connections.push(this._connection);
         } else {
-          try {
-            connections.push(
-              new Connection(ep.url, {
+          // M12: Reuse cached connections instead of creating new ones
+          let cached = this._connectionCache.get(ep.url);
+          if (!cached) {
+            try {
+              cached = new Connection(ep.url, {
                 commitment: 'confirmed',
                 disableRetryOnRateLimit: true,
                 fetch: (url, options) => fetch(url, { ...options, signal: AbortSignal.timeout(30_000) }),
-              }),
-            );
-          } catch {
-            // Skip invalid endpoints
+              });
+              this._connectionCache.set(ep.url, cached);
+            } catch {
+              continue;
+            }
           }
+          connections.push(cached);
         }
       }
     }

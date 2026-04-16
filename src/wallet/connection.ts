@@ -53,6 +53,14 @@ export function createConnection(rpcUrl: string, config?: { commitment?: Commitm
     commitment: config?.commitment ?? 'confirmed',
     confirmTransactionInitialTimeout: TX_CONFIRM_TIMEOUT_MS,
     wsEndpoint,
-    fetch: (url, options) => fetch(url, { ...options, signal: AbortSignal.timeout(RPC_FETCH_TIMEOUT_MS) }),
+    fetch: async (url, options) => {
+      const res = await fetch(url, { ...options, signal: AbortSignal.timeout(RPC_FETCH_TIMEOUT_MS) });
+      // M16: Guard against oversized RPC responses (2MB limit)
+      const contentLen = res.headers.get('content-length');
+      if (contentLen && parseInt(contentLen, 10) > 2_097_152) {
+        throw new Error(`RPC response too large: ${contentLen} bytes`);
+      }
+      return res;
+    },
   });
 }

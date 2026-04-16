@@ -45,9 +45,16 @@ export class AlertManager {
   private handlers: AlertHandler[] = [];
   private recentAlerts: Alert[] = [];
   private static readonly MAX_RECENT = 100;
+  private static readonly MAX_HANDLERS = 50;
 
   /** Register an alert handler. Returns unsubscribe function. */
   onAlert(handler: AlertHandler): () => void {
+    if (this.handlers.length >= AlertManager.MAX_HANDLERS) {
+      try {
+        getLogger().warn('ALERT', `Max alert handlers (${AlertManager.MAX_HANDLERS}) reached — ignoring new handler`);
+      } catch { /* logging must never throw */ }
+      return () => {}; // no-op unsubscribe
+    }
     this.handlers.push(handler);
     return () => {
       this.handlers = this.handlers.filter((h) => h !== handler);

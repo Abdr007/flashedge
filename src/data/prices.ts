@@ -59,6 +59,8 @@ export class PriceService {
   private cacheTtlMs = 5_000; // 5s cache — Pyth is free, no rate limiting concern
   private lastMissingWarnTime = 0;
   private static readonly MISSING_WARN_INTERVAL_MS = 60_000;
+  /** Tracks consecutive deviation rejections per symbol for baseline reset */
+  private _deviationRejectCount: Map<string, number> = new Map();
 
   async getPrices(symbols: string[]): Promise<Map<string, TokenPrice>> {
     const priceMap = new Map<string, TokenPrice>();
@@ -186,15 +188,32 @@ export class PriceService {
         if (!Number.isFinite(price) || price <= 0) continue;
 
         // Price deviation check against cache
+        // If 3+ consecutive prices are rejected, reset baseline (probably a real price move)
         const cached = this.cache.get(sym);
         if (cached && cached.data.price > 0) {
           const deviation = Math.abs(price - cached.data.price) / cached.data.price;
           if (deviation > 0.5) {
-            getLogger().warn(
-              'PRICE',
-              `Flash API: rejecting suspicious ${sym}: $${price} vs cached $${cached.data.price.toFixed(2)}`,
-            );
-            continue;
+            const rejectKey = `_reject_${sym}`;
+            const rejectCount = (this._deviationRejectCount.get(rejectKey) ?? 0) + 1;
+            this._deviationRejectCount.set(rejectKey, rejectCount);
+            if (rejectCount >= 3) {
+              // 3+ consecutive rejections — baseline is stale, reset to this price
+              getLogger().warn(
+                'PRICE',
+                `Flash API: resetting ${sym} baseline after ${rejectCount} consecutive rejections: $${cached.data.price.toFixed(2)} → $${price}`,
+              );
+              this._deviationRejectCount.set(rejectKey, 0);
+              // Allow this price through by not continuing
+            } else {
+              getLogger().warn(
+                'PRICE',
+                `Flash API: rejecting suspicious ${sym}: $${price} vs cached $${cached.data.price.toFixed(2)} (reject #${rejectCount})`,
+              );
+              continue;
+            }
+          } else {
+            // Price accepted — reset rejection counter
+            this._deviationRejectCount.set(`_reject_${sym}`, 0);
           }
         }
 
@@ -257,8 +276,12 @@ export class PriceService {
    */
   private pruneHistory(history: PriceSnapshot[]): void {
     const cutoff = Date.now() - HISTORY_WINDOW_MS;
-    while (history.length > 0 && history[0].timestamp < cutoff) {
-      history.shift();
+    // Use filter+splice instead of O(n^2) shift loop
+    const firstValidIdx = history.findIndex((s) => s.timestamp >= cutoff);
+    if (firstValidIdx > 0) {
+      history.splice(0, firstValidIdx);
+    } else if (firstValidIdx === -1 && history.length > 0) {
+      history.splice(0, history.length); // all expired
     }
     if (history.length > MAX_HISTORY_PER_SYMBOL) {
       history.splice(0, history.length - MAX_HISTORY_PER_SYMBOL);
@@ -301,9 +324,9 @@ export class PriceService {
       }
     }
 
-    if (closest.price > 0 && Number.isFinite(closest.price)) {
+    if (closest.price > 0 && Number.isFinite(closest.price) && Number.isFinite(currentPrice)) {
       const change = ((currentPrice - closest.price) / closest.price) * 100;
-      if (Number.isFinite(change)) return change;
+      return Number.isFinite(change) ? change : NaN;
     }
 
     return NaN;

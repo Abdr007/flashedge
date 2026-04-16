@@ -202,6 +202,7 @@ export function logTxConfirmed(txSignature: string, durationMs: number): void {
 /** Emitted on transaction timeout/failure. */
 export function logTxTimeout(txSignature: string, durationMs: number, error: string): void {
   try {
+    getMetrics().increment(METRIC.TRADE_FAILURE);
     getLogger().warn('TX', 'Transaction timeout/failure', {
       event: 'tx_timeout',
       txSignature,

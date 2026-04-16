@@ -303,8 +303,8 @@ export const earnRemoveLiquidityTool: ToolDefinition = {
               for (const token of tokenData.tokens) {
                 const resolved = resolveTokenMint(token.mint);
                 if (resolved && resolved.pool.poolId === pool.poolId && resolved.type === 'FLP') {
-                  // Balance already reduced by withdraw — estimate pre-withdraw balance
-                  const preWithdrawBalance = token.amount / (1 - percent / 100);
+                  // M22: Handle 100% withdrawal (avoid division by zero)
+                  const preWithdrawBalance = percent >= 100 ? token.amount : token.amount / (1 - percent / 100);
                   positionValue = preWithdrawBalance * m.flpPrice;
                   break;
                 }

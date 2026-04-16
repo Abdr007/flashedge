@@ -177,8 +177,9 @@ export class Logger {
         .replace(/api[_-]?key=[^&\s"]+/gi, 'api_key=***')
         .replace(/sk-ant-[^\s"]+/g, 'sk-ant-***')
         .replace(/gsk_[^\s"]+/g, 'gsk_***')
-        // [L-12] Mask base58 private keys (64-88 chars of base58 alphabet)
-        .replace(/[1-9A-HJ-NP-Za-km-z]{64,88}/g, (m) => m.slice(0, 8) + '***REDACTED***')
+        // H12: Only redact likely private keys (88-char base58 = ed25519 secret keys)
+        // Skip 64-87 char strings which are likely tx signatures (needed for debugging)
+        .replace(/[1-9A-HJ-NP-Za-km-z]{88}/g, (m) => m.slice(0, 8) + '***REDACTED***')
         // [F-10] Truncate full URLs to origin only — prevent leaking paths/tokens
         .replace(/https?:\/\/[^\s"']+/g, (url) => {
           try { return new URL(url).origin + '/***'; } catch { return url; }

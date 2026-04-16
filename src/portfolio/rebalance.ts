@@ -133,7 +133,11 @@ export function analyzeRebalance(positions: Position[], totalCapital: number): R
             type: 'reduce_collateral',
             market: target.market,
             side: target.side,
-            amount: Math.round(Math.max(10, target.leverage > 0 ? reductionTarget / target.leverage : reductionTarget)),
+            // M23: Cap removal — never leave less than $10 collateral remaining
+            amount: Math.round(Math.min(
+              Math.max(10, target.leverage > 0 ? reductionTarget / target.leverage : reductionTarget),
+              Math.max(0, target.collateralUsd - 10),
+            )),
             reason: `${market} concentration ${(pct * 100).toFixed(0)}%: reduce by ~$${Math.round(reductionTarget)}`,
           });
         }

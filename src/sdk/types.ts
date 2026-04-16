@@ -105,6 +105,17 @@ export interface TradeResult {
   prompt?: string;
 }
 
+/** Trade result with all fields confirmed (post-execution). */
+export interface ConfirmedTradeResult {
+  market: string;
+  side: string;
+  leverage: number;
+  collateral: number;
+  sizeUsd: number;
+  entryPrice: number;
+  tx_signature: string;
+}
+
 // ─── Portfolio ───────────────────────────────────────────────────────────────
 
 export interface Portfolio {
@@ -248,6 +259,8 @@ export interface WatchOptions {
   deduplicate?: boolean;
   /** Maximum number of iterations (0 = unlimited). Defaults to 0. */
   maxIterations?: number;
+  /** Called when 5 consecutive errors occur (watch loop stops). */
+  onError?: (error: Error, consecutiveFailures: number) => void;
 }
 
 export interface WatchHandle {

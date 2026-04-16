@@ -1,6 +1,25 @@
 import { ToolDefinition, ToolContext } from '../types/index.js';
 import { getLogger } from '../utils/logger.js';
 import { getErrorMessage } from '../utils/retry.js';
+import { existsSync, readFileSync } from 'fs';
+import { join } from 'path';
+import { homedir } from 'os';
+
+const ALLOWED_PLUGINS_FILE = join(homedir(), '.flash', 'allowed-plugins.json');
+const PLUGIN_INIT_TIMEOUT_MS = 5_000;
+
+/** Load the plugin allowlist from ~/.flash/allowed-plugins.json */
+function loadAllowedPlugins(): Set<string> | null {
+  try {
+    if (!existsSync(ALLOWED_PLUGINS_FILE)) return null; // No allowlist = allow all (backwards compat)
+    const raw = readFileSync(ALLOWED_PLUGINS_FILE, 'utf-8');
+    const data = JSON.parse(raw);
+    if (Array.isArray(data)) return new Set(data.map(String));
+    return null;
+  } catch {
+    return null;
+  }
+}
 
 // ─── Plugin Interface ───────────────────────────────────────────────────────
 
@@ -85,8 +104,20 @@ export async function loadPlugins(context: ToolContext): Promise<ToolDefinition[
         f !== 'plugin-loader.js',
     );
 
+    // Load allowlist — if file exists, only allowed plugins are loaded
+    const allowlist = loadAllowedPlugins();
+    if (allowlist) {
+      logger.info('PLUGINS', `Plugin allowlist active: ${allowlist.size} allowed plugin(s)`);
+    }
+
     for (const file of pluginFiles) {
       try {
+        // Allowlist check: if allowlist exists, skip plugins not in it
+        if (allowlist && !allowlist.has(file)) {
+          logger.warn('PLUGINS', `Skipping ${file}: not in allowed-plugins.json allowlist`);
+          continue;
+        }
+
         const modulePath = join(pluginsDir, file);
         // Use pathToFileURL for correct cross-platform URL encoding
         const { pathToFileURL } = await import('url');
@@ -105,20 +136,33 @@ export async function loadPlugins(context: ToolContext): Promise<ToolDefinition[
           continue;
         }
 
-        // Register tools
+        // Register tools (with try/catch to prevent bad plugin from crashing system)
         if (plugin.tools) {
-          const tools = plugin.tools();
-          for (const tool of tools) {
-            allTools.push(tool);
+          try {
+            const tools = plugin.tools();
+            for (const tool of tools) {
+              allTools.push(tool);
+            }
+            logger.info('PLUGINS', `Loaded ${plugin.name}: ${tools.length} tool(s)`);
+          } catch (toolError: unknown) {
+            logger.warn('PLUGINS', `Plugin ${plugin.name} tools() threw: ${getErrorMessage(toolError)}`);
           }
-          logger.info('PLUGINS', `Loaded ${plugin.name}: ${tools.length} tool(s)`);
         } else {
           logger.info('PLUGINS', `Loaded ${plugin.name} (no tools)`);
         }
 
-        // Call onInit
+        // Call onInit with timeout (5s)
         if (plugin.onInit) {
-          await plugin.onInit(context);
+          try {
+            await Promise.race([
+              Promise.resolve(plugin.onInit(context)),
+              new Promise<void>((_, reject) =>
+                setTimeout(() => reject(new Error('onInit timed out')), PLUGIN_INIT_TIMEOUT_MS),
+              ),
+            ]);
+          } catch (initError: unknown) {
+            logger.warn('PLUGINS', `Plugin ${plugin.name} onInit failed: ${getErrorMessage(initError)}`);
+          }
         }
 
         loadedPlugins.push(plugin);

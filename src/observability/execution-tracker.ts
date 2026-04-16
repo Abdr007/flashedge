@@ -47,6 +47,8 @@ export interface ExecutionStats {
 // ─── Constants ──────────────────────────────────────────────────────────────
 
 const MAX_HISTORY = 200;
+const MAX_ACTIVE_SIZE = 100;
+const ACTIVE_TTL_MS = 5 * 60_000; // 5 minutes
 const LOG_CATEGORY = 'EXECUTION';
 
 // ─── Tracker State ──────────────────────────────────────────────────────────
@@ -74,6 +76,16 @@ export function trackExecutionStart(
     success: false,
     params,
   };
+
+  // Prune expired entries from _active to prevent unbounded growth
+  if (_active.size >= MAX_ACTIVE_SIZE) {
+    const now = Date.now();
+    for (const [id, t] of _active) {
+      if (now - t.startedAt > ACTIVE_TTL_MS) {
+        _active.delete(id);
+      }
+    }
+  }
 
   _active.set(executionId, telemetry);
 

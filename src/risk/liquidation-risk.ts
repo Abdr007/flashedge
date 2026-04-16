@@ -10,7 +10,10 @@ import { Position, RiskAssessment, TradeSide } from '../types/index.js';
 export function assessLiquidationRisk(position: Position): RiskAssessment {
   let distancePct = 0;
 
-  const curPrice = Number.isFinite(position.currentPrice) ? position.currentPrice : 0;
+  // M20: Fall back to markPrice if currentPrice is zero/missing
+  const curPrice = (Number.isFinite(position.currentPrice) && position.currentPrice > 0)
+    ? position.currentPrice
+    : (Number.isFinite(position.markPrice) && (position.markPrice ?? 0) > 0 ? position.markPrice! : 0);
   const liqPrice = Number.isFinite(position.liquidationPrice) ? position.liquidationPrice : 0;
   const entryPrice = Number.isFinite(position.entryPrice) ? position.entryPrice : 0;
 

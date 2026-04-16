@@ -149,7 +149,7 @@ export const OpenPositionSchema = z.object({
   market: z.string().max(20),
   side: z.nativeEnum(TradeSide),
   collateral: z.number().positive().max(10_000_000),
-  leverage: z.number().min(1).max(100), // protocol max 100x; per-market limits enforced at tool level
+  leverage: z.number().min(1).max(1000), // schema max 1000x for degen mode; per-market limits enforced at tool level
   collateral_token: z.string().max(20).optional(),
   takeProfit: z.number().positive().optional(),
   stopLoss: z.number().positive().optional(),
@@ -431,7 +431,7 @@ export const LimitOrderSchema = z.object({
   action: z.literal(ActionType.LimitOrder),
   market: z.string().max(20),
   side: z.nativeEnum(TradeSide),
-  leverage: z.number().min(1).max(100),
+  leverage: z.number().min(1).max(1000), // schema max 1000x for degen mode; per-market limits enforced at tool level
   collateral: z.number().positive().max(10_000_000),
   limitPrice: z.number().positive(),
 });
@@ -1188,6 +1188,8 @@ export interface SimulatedPosition {
   maintenanceMarginRate: number;
   /** Close fee rate from protocol. Stored at open time. */
   closeFeeRate: number;
+  /** Cached liquidation price — recalculated on merge/collateral change */
+  liquidationPrice?: number;
   /** Take-profit price (simulation TP/SL) */
   takeProfit?: number;
   /** Stop-loss price (simulation TP/SL) */

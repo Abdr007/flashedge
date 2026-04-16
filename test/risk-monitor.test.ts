@@ -157,8 +157,8 @@ describe('RiskMonitor', () => {
       const monitor = new RiskMonitor(makeMockClient([pos]));
       const assessed = await (monitor as any).assessPosition(pos);
 
-      // distance = |currentPrice - liqPrice| / entryPrice = |140 - 125| / 150 = 0.10
-      expect(assessed.distanceToLiquidation).toBeCloseTo(0.10, 2);
+      // H6 fix: distance = |currentPrice - liqPrice| / currentPrice = |140 - 125| / 140 ≈ 0.107
+      expect(assessed.distanceToLiquidation).toBeCloseTo(15 / 140, 2);
     });
 
     it('clamps distance between 0 and 1', async () => {

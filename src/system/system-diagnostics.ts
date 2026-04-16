@@ -412,7 +412,8 @@ export class SystemDiagnostics {
     try {
       const { PoolConfig: SDKPoolConfig } = await import('flash-sdk');
       const { POOL_MARKETS } = await import('../config/index.js');
-      const network = this.context.simulationMode ? 'mainnet-beta' : 'mainnet-beta';
+      // M32: Use config network instead of dead conditional
+      const network = this.context.config?.network ?? 'mainnet-beta';
       for (const poolName of Object.keys(POOL_MARKETS)) {
         try {
           const pc = SDKPoolConfig.fromIdsByName(poolName, network);

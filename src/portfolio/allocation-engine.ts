@@ -176,8 +176,8 @@ export function filterOpportunities(
     } else {
       shortExposure += notional;
     }
-    // Deduct from free capital — prevents multiple opportunities sharing the same capital
-    freeCapital -= opp.recommendedCollateral;
+    // M21: Deduct actual allocated amount, not raw recommended (which may exceed free capital)
+    freeCapital -= Math.min(opp.recommendedCollateral, freeCapital);
   }
 
   return { accepted, rejected };

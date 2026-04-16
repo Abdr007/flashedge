@@ -10,6 +10,7 @@ import {
   humanizeSdkError,
 } from '../utils/format.js';
 import { getErrorMessage } from '../utils/retry.js';
+import { getLogger } from '../utils/logger.js';
 import { getProtocolFeeRates, calcFeeUsd, ProtocolParameterError } from '../utils/protocol-fees.js';
 import { filterValidPositions } from '../core/invariants.js';
 import { getSigningGuard } from '../security/signing-guard.js';
@@ -29,6 +30,11 @@ import { getTradeJournal } from '../journal/trade-journal.js';
 import chalk from 'chalk';
 import { theme } from '../cli/theme.js';
 import { resolveMarket } from '../utils/market-resolver.js';
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+/** L1: Minimum collateral in USD — used for open position validation and remove collateral dust check. */
+const MIN_COLLATERAL_USD = 10;
 
 // ─── Trade Helpers (extracted to trade-helpers.ts) ──────────────────────────
 
@@ -103,8 +109,9 @@ export const flashOpenPosition: ToolDefinition = {
       };
     }
 
-    if (collateral < 10) {
-      return { success: false, message: chalk.red(`  Minimum collateral is $10 (got $${collateral}).`) };
+    // L1: Use extracted constant instead of hardcoded value
+    if (collateral < MIN_COLLATERAL_USD) {
+      return { success: false, message: chalk.red(`  Minimum collateral is $${MIN_COLLATERAL_USD} (got $${collateral}).`) };
     }
 
     // Per-market leverage limit from Flash Trade protocol
@@ -227,6 +234,9 @@ export const flashOpenPosition: ToolDefinition = {
     }
 
     // ── Build Confirmation Summary ──
+    // M19: sizeUsd is computed before fee deduction — show net size estimate for transparency
+    const netCollateral = collateral - estimatedFee;
+    const netSizeUsd = netCollateral > 0 ? netCollateral * leverage : 0;
     const lines = [
       '',
       isLive ? chalk.red.bold('  CONFIRM TRANSACTION') : chalk.yellow('  CONFIRM TRANSACTION'),
@@ -235,7 +245,8 @@ export const flashOpenPosition: ToolDefinition = {
       `  Pool:        ${chalk.cyan(pool)}`,
       `  Leverage:    ${chalk.bold(leverage + 'x')}`,
       `  Collateral:  ${chalk.bold(formatUsd(collateral))} ${chalk.dim('USDC')}`,
-      `  Size:        ${chalk.bold(formatUsd(sizeUsd))}`,
+      `  Size:        ${chalk.bold(formatUsd(sizeUsd))} ${chalk.dim('(before fees)')}`,
+      `  Net Size:    ${chalk.bold(formatUsd(netSizeUsd))} ${chalk.dim('(est. after open fee)')}`,
       `  Wallet:      ${chalk.dim(walletAddr)}`,
     ];
 
@@ -597,7 +608,7 @@ export const flashClosePosition: ToolDefinition = {
       return { success: false, message: chalk.red(`  ${rateCheck.reason}`) };
     }
 
-    // Pre-check: verify position exists and validate partial close
+    // H9: Pre-check: verify position exists and validate partial close — log errors instead of swallowing
     try {
       const positions = await context.flashClient.getPositions();
       const pos = positions.find((p) => (p.market ?? '').toUpperCase() === market.toUpperCase() && p.side === side);
@@ -620,8 +631,9 @@ export const flashClosePosition: ToolDefinition = {
           ),
         };
       }
-    } catch {
-      // Non-critical: let the close attempt handle the error
+    } catch (preCheckErr: unknown) {
+      // H9: warn instead of silently swallowing — let the close attempt continue
+      getLogger().warn('CLOSE', `Could not verify position existence: ${getErrorMessage(preCheckErr)}`);
     }
 
     // Build close description
@@ -1019,6 +1031,15 @@ export const flashRemoveCollateral: ToolDefinition = {
           success: false,
           message: chalk.red(
             `  Cannot remove ${formatUsd(amount)} — position only has ${formatUsd(pos.collateralUsd)} collateral. Close position instead.`,
+          ),
+        };
+      }
+      // C6: Check minimum remaining collateral to prevent dust positions
+      if (pos.collateralUsd && pos.collateralUsd - amount < MIN_COLLATERAL_USD) {
+        return {
+          success: false,
+          message: chalk.red(
+            `  Cannot remove $${amount.toFixed(2)} — would leave less than $${MIN_COLLATERAL_USD} collateral. Use close position instead.`,
           ),
         };
       }

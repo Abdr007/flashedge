@@ -2,6 +2,10 @@ import { z } from 'zod';
 import { ToolDefinition, ToolContext, ToolResult, TradeSide } from '../types/index.js';
 import { colorPnl, colorSide } from '../utils/format.js';
 import { getErrorMessage } from '../utils/retry.js';
+import { getTradingGate } from '../security/trading-gate.js';
+import { getCircuitBreaker } from '../security/circuit-breaker.js';
+import { getSigningGuard } from '../security/signing-guard.js';
+import { logKillSwitchBlock, logCircuitBreakerBlock } from '../observability/trade-events.js';
 import chalk from 'chalk';
 import { theme } from '../cli/theme.js';
 
@@ -13,43 +17,92 @@ export const flashCloseAll: ToolDefinition = {
   parameters: z.object({}),
   execute: async (_params, context): Promise<ToolResult> => {
     try {
+      // ── Trading Gate: Kill Switch ──
+      const gate = getTradingGate();
+      const killCheck = gate.checkKillSwitch();
+      if (!killCheck.allowed) {
+        logKillSwitchBlock('ALL', 'close_all');
+        return { success: false, message: chalk.red(`  ${killCheck.reason}`) };
+      }
+
+      // ── Circuit Breaker ──
+      const breaker = getCircuitBreaker();
+      const breakerCheck = breaker.check();
+      if (!breakerCheck.allowed) {
+        logCircuitBreakerBlock('ALL', 'close_all', breakerCheck.reason ?? 'unknown');
+        return { success: false, message: chalk.red(`  ${breakerCheck.reason}`) };
+      }
+
+      // ── Signing Guard: Rate Limit Check ──
+      const guard = getSigningGuard();
+      const rateCheck = guard.checkRateLimit();
+      if (!rateCheck.allowed) {
+        return { success: false, message: chalk.red(`  ${rateCheck.reason}`) };
+      }
+
       const positions = await context.flashClient.getPositions();
       if (positions.length === 0) {
         return { success: true, message: chalk.yellow('  No open positions to close.') };
       }
 
-      const lines: string[] = [
+      const confirmLines: string[] = [
         '',
-        `  ${theme.accentBold('CLOSE ALL POSITIONS')}  ${theme.dim(`(${positions.length} position${positions.length > 1 ? 's' : ''})`)}`,
+        chalk.red.bold('  CONFIRM TRANSACTION — Close All Positions'),
+        chalk.dim('  ─────────────────────────────────'),
+        `  Positions:   ${chalk.bold(String(positions.length))}`,
         '',
       ];
-
-      let closed = 0;
-      let totalPnl = 0;
-      const errors: string[] = [];
-
       for (const pos of positions) {
-        try {
-          const result = await context.flashClient.closePosition(pos.market, pos.side as TradeSide);
-          closed++;
-          const pnl = result.pnl ?? 0;
-          totalPnl += pnl;
-          lines.push(`  ${chalk.green('✓')} ${pos.market} ${colorSide(pos.side)} — PnL: ${colorPnl(pnl)}`);
-        } catch (err: unknown) {
-          errors.push(`${pos.market} ${pos.side}: ${getErrorMessage(err)}`);
-          lines.push(`  ${chalk.red('✗')} ${pos.market} ${colorSide(pos.side)} — ${chalk.red(getErrorMessage(err))}`);
-        }
+        confirmLines.push(`    ${chalk.bold(pos.market)} ${colorSide(pos.side)} — Size: $${pos.sizeUsd.toFixed(2)} — PnL: ${colorPnl(pos.unrealizedPnl)}`);
+      }
+      confirmLines.push('');
+      if (!context.simulationMode) {
+        confirmLines.push(chalk.red('  This will execute REAL on-chain transactions.'));
+        confirmLines.push('');
       }
 
-      lines.push('');
-      lines.push(`  ${theme.dim('─'.repeat(40))}`);
-      lines.push(`  Closed: ${chalk.bold(String(closed))}/${positions.length}  |  Total PnL: ${colorPnl(totalPnl)}`);
-      if (errors.length > 0) {
-        lines.push(`  ${chalk.red(`${errors.length} failed`)}`);
-      }
-      lines.push('');
+      return {
+        success: true,
+        message: confirmLines.join('\n'),
+        requiresConfirmation: true,
+        confirmationPrompt: !context.simulationMode ? 'Type "yes" to sign or "no" to cancel' : 'Close all positions?',
+        data: {
+          executeAction: async (): Promise<ToolResult> => {
+            const lines: string[] = [
+              '',
+              `  ${theme.accentBold('CLOSE ALL POSITIONS')}  ${theme.dim(`(${positions.length} position${positions.length > 1 ? 's' : ''})`)}`,
+              '',
+            ];
 
-      return { success: errors.length === 0, message: lines.join('\n') };
+            let closed = 0;
+            let totalPnl = 0;
+            const errors: string[] = [];
+
+            for (const pos of positions) {
+              try {
+                const result = await context.flashClient.closePosition(pos.market, pos.side as TradeSide);
+                closed++;
+                const pnl = result.pnl ?? 0;
+                totalPnl += pnl;
+                lines.push(`  ${chalk.green('✓')} ${pos.market} ${colorSide(pos.side)} — PnL: ${colorPnl(pnl)}`);
+              } catch (err: unknown) {
+                errors.push(`${pos.market} ${pos.side}: ${getErrorMessage(err)}`);
+                lines.push(`  ${chalk.red('✗')} ${pos.market} ${colorSide(pos.side)} — ${chalk.red(getErrorMessage(err))}`);
+              }
+            }
+
+            lines.push('');
+            lines.push(`  ${theme.dim('─'.repeat(40))}`);
+            lines.push(`  Closed: ${chalk.bold(String(closed))}/${positions.length}  |  Total PnL: ${colorPnl(totalPnl)}`);
+            if (errors.length > 0) {
+              lines.push(`  ${chalk.red(`${errors.length} failed`)}`);
+            }
+            lines.push('');
+
+            return { success: errors.length === 0, message: lines.join('\n') };
+          },
+        },
+      };
     } catch (err: unknown) {
       return { success: false, message: chalk.red(`  Failed to close all: ${getErrorMessage(err)}`) };
     }
@@ -78,6 +131,39 @@ export const flashReversePosition: ToolDefinition = {
       return { success: false, message: '  Reverse position not supported by the current client.' };
     }
 
+    // ── Trading Gate: Kill Switch ──
+    const gate = getTradingGate();
+    const killCheck = gate.checkKillSwitch();
+    if (!killCheck.allowed) {
+      logKillSwitchBlock(market, side);
+      return { success: false, message: chalk.red(`  ${killCheck.reason}`) };
+    }
+
+    // ── Circuit Breaker ──
+    const breaker = getCircuitBreaker();
+    const breakerCheck = breaker.check();
+    if (!breakerCheck.allowed) {
+      logCircuitBreakerBlock(market, side, breakerCheck.reason ?? 'unknown');
+      return { success: false, message: chalk.red(`  ${breakerCheck.reason}`) };
+    }
+
+    // ── Signing Guard: Rate Limit Check ──
+    const guard = getSigningGuard();
+    const walletAddr = context.walletAddress ?? 'unknown';
+    const rateCheck = guard.checkRateLimit();
+    if (!rateCheck.allowed) {
+      guard.logAudit({
+        timestamp: new Date().toISOString(),
+        type: 'reverse',
+        market,
+        side,
+        walletAddress: walletAddr,
+        result: 'rate_limited',
+        reason: rateCheck.reason,
+      });
+      return { success: false, message: chalk.red(`  ${rateCheck.reason}`) };
+    }
+
     // Show current position info
     const positions = await context.flashClient.getPositions();
     const pos = positions.find((p) => p.market?.toUpperCase() === market && p.side === side);
@@ -91,15 +177,22 @@ export const flashReversePosition: ToolDefinition = {
 
     const lines = [
       '',
-      `  ${theme.accentBold('CONFIRM TRANSACTION — Reverse Position')}`,
+      isLive
+        ? chalk.red.bold('  CONFIRM TRANSACTION — Reverse Position')
+        : chalk.yellow('  CONFIRM TRANSACTION — Reverse Position'),
       `  ${theme.separator(35)}`,
       `  Market:      ${market} ${sideStr.toUpperCase()} → ${newSide}`,
       `  Size:    $${pos.sizeUsd.toFixed(2)}`,
       `  Entry:   $${pos.entryPrice.toFixed(4)}`,
       `  PnL:     ${colorPnl(pos.unrealizedPnl)}`,
-      `  Wallet:      ${context.walletAddress}`,
+      `  Wallet:      ${walletAddr}`,
       '',
     ];
+
+    if (isLive) {
+      lines.push(chalk.red('  This will execute a REAL on-chain transaction.'));
+      lines.push('');
+    }
 
     return {
       success: true,
@@ -111,6 +204,17 @@ export const flashReversePosition: ToolDefinition = {
           console.log('  Submitting transaction...');
           try {
             const result = await client.reversePosition!(market, side);
+
+            guard.recordSigning();
+            guard.logAudit({
+              timestamp: new Date().toISOString(),
+              type: 'reverse',
+              market,
+              side,
+              walletAddress: walletAddr,
+              result: 'confirmed',
+            });
+
             const resultLines = [
               `  ${chalk.green('✔')} Position reversed`,
               `  ${chalk.dim('From:')} ${market} ${sideStr.toUpperCase()} → ${chalk.dim('To:')} ${market} ${result.newSide.toUpperCase()}`,
@@ -121,6 +225,15 @@ export const flashReversePosition: ToolDefinition = {
             ];
             return { success: true, message: resultLines.join('\n') };
           } catch (err: unknown) {
+            guard.logAudit({
+              timestamp: new Date().toISOString(),
+              type: 'reverse',
+              market,
+              side,
+              walletAddress: walletAddr,
+              result: 'failed',
+              reason: getErrorMessage(err),
+            });
             return { success: false, message: `  Failed to reverse position: ${getErrorMessage(err)}` };
           }
         },
@@ -308,7 +421,7 @@ export const limitOrderPlaceTool: ToolDefinition = {
   parameters: z.object({
     market: z.string(),
     side: z.nativeEnum(TradeSide),
-    leverage: z.number().min(1).max(100),
+    leverage: z.number().min(1).max(1000),
     collateral: z.number().positive(),
     limitPrice: z.number().positive(),
   }),

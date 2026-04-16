@@ -68,8 +68,7 @@ describe('Trade Command Regression (33 patterns)', () => {
     ['lon sol 2x 10', 'SOL', 'long', 2, 10],
     ['lonng sol 2x 10', 'SOL', 'long', 2, 10],
     ['solan long 2x 10', 'SOL', 'long', 2, 10],
-    ['l sol 2x 10', 'SOL', 'long', 2, 10],
-    ['s btc 3x 50', 'BTC', 'short', 3, 50],
+    // C7: 'l' and 's' aliases removed for safety — use 'long'/'short' explicitly
     ['sol-perp long 2x 10', 'SOL', 'long', 2, 10],
     ['long sol 2x 10 tp 160 sl 120', 'SOL', 'long', 2, 10],
     ['open btc short 3x 50 tp 25000', 'BTC', 'short', 3, 50],

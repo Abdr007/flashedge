@@ -45,11 +45,14 @@ export class RegimeDetector {
 
     // 1. Trend detection
     // We only have 24h change from MarketData, so estimate shorter timeframes
-    // by scaling: 1h ≈ 24h/6, 4h ≈ 24h/2 (rough heuristic for available data)
+    // using compounding (square-root scaling) instead of linear division.
+    // For a 24h change c, the n-hour compounded estimate is: sign(c) * |c|^(n/24)
     const priceChange24h = Number.isFinite(market.priceChange24h) ? market.priceChange24h : 0;
+    const abs24h = Math.abs(priceChange24h);
+    const sign24h = Math.sign(priceChange24h);
     const trend = computeTrend({
-      priceChange1h: priceChange24h / 6, // estimated
-      priceChange4h: priceChange24h / 2, // estimated
+      priceChange1h: sign24h * Math.pow(abs24h, 1 / 24), // compounded 1h estimate
+      priceChange4h: sign24h * Math.pow(abs24h, 4 / 24), // compounded 4h estimate
       priceChange24h,
     });
 

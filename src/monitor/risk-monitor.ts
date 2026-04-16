@@ -331,11 +331,11 @@ export class RiskMonitor {
       };
     }
 
-    // Distance to liquidation: normalized by entry price (not liq price)
-    // This gives a consistent percentage regardless of price direction
+    // Distance to liquidation: normalized by current price (H6 fix)
+    // Measures how much the current price needs to move % to reach liquidation
     let distance = 1; // default safe
-    if (liqPrice > 0 && currentPrice > 0 && entryPrice > 0) {
-      distance = Math.abs(currentPrice - liqPrice) / entryPrice;
+    if (liqPrice > 0 && currentPrice > 0) {
+      distance = Math.abs(currentPrice - liqPrice) / currentPrice;
     }
     distance = Math.min(Math.max(distance, 0), 1); // clamp 0..1
 
@@ -407,8 +407,8 @@ export class RiskMonitor {
 
     if (liqPrice <= 0 || currentPrice <= 0 || entryPrice <= 0 || sizeUsd <= 0 || collateralUsd <= 0) return 0;
 
-    // Use entryPrice as denominator (consistent with assessPosition)
-    const currentDistance = Math.abs(currentPrice - liqPrice) / entryPrice;
+    // H7 fix: use currentPrice as denominator (consistent with assessPosition H6 fix)
+    const currentDistance = Math.abs(currentPrice - liqPrice) / currentPrice;
     if (currentDistance >= TARGET_SAFE_DISTANCE) return 0; // already safe
 
     // Fetch protocol rates for this market
@@ -430,8 +430,8 @@ export class RiskMonitor {
         feeRates.maintenanceMarginRate,
         feeRates.closeFeeRate,
       );
-      // Use entryPrice as denominator (consistent)
-      const newDistance = Math.abs(currentPrice - newLiqPrice) / entryPrice;
+      // H7 fix: use currentPrice as denominator (consistent)
+      const newDistance = Math.abs(currentPrice - newLiqPrice) / currentPrice;
       if (newDistance < TARGET_SAFE_DISTANCE) {
         lo = mid;
       } else {

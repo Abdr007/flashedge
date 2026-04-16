@@ -45,6 +45,8 @@ function buildOrderedIxs(
 }
 import { getRpcManagerInstance } from '../network/rpc-manager.js';
 import { getErrorMessage } from '../utils/retry.js';
+import { validateInstructionPrograms } from '../client/flash-client.js';
+import { checkCircuitBreaker } from './execution-circuit-breaker.js';
 import { getLeaderRouter, initLeaderRouter, shutdownLeaderRouter } from './leader-router.js';
 import { getTpuClient } from '../network/tpu-client.js';
 
@@ -213,7 +215,7 @@ export class UltraTxEngine {
   private broadcastRefreshTimer: ReturnType<typeof setInterval> | null = null;
 
   // Concurrency guard — prevents parallel submitTransaction calls from racing
-  private submitInProgress = false;
+  private submitInProgressPromise: Promise<TxSubmitResult> | null = null;
 
   // Metrics
   private metricsHistory: TxMetrics[] = [];
@@ -762,22 +764,22 @@ export class UltraTxEngine {
     addressLookupTableAccounts?: AddressLookupTableAccount[],
     computeUnitLimitOverride?: number,
   ): Promise<TxSubmitResult> {
-    // Concurrency guard — only one submitTransaction at a time
-    if (this.submitInProgress) {
-      throw new Error('Another transaction is already in progress. Wait for it to complete.');
+    // Concurrency guard — if a submission is in progress, await it instead of allowing bypass
+    if (this.submitInProgressPromise) {
+      return this.submitInProgressPromise;
     }
-    this.submitInProgress = true;
 
-    try {
-      return await this._submitTransactionInner(
-        instructions,
-        additionalSigners,
-        addressLookupTableAccounts,
-        computeUnitLimitOverride,
-      );
-    } finally {
-      this.submitInProgress = false;
-    }
+    const promise = this._submitTransactionInner(
+      instructions,
+      additionalSigners,
+      addressLookupTableAccounts,
+      computeUnitLimitOverride,
+    ).finally(() => {
+      this.submitInProgressPromise = null;
+    });
+
+    this.submitInProgressPromise = promise;
+    return promise;
   }
 
   private async _submitTransactionInner(
@@ -929,7 +931,7 @@ export class UltraTxEngine {
             );
             const tightCuLimitIx = ComputeBudgetProgram.setComputeUnitLimit({ units: dynamicLimit });
             const tightCuPriceIx = ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFee });
-            const tightIxs = [tightCuLimitIx, tightCuPriceIx, ...instructions];
+            const tightIxs = buildOrderedIxs(tightCuLimitIx, tightCuPriceIx, instructions);
             const tightMsg = MessageV0.compile({
               payerKey: this.wallet.publicKey,
               instructions: tightIxs,
@@ -1200,6 +1202,10 @@ export class UltraTxEngine {
     blockhashAge: () => number;
     isExpired: () => boolean;
   }> {
+    // Security validation — must run before building prebuilt transactions
+    checkCircuitBreaker();
+    validateInstructionPrograms(instructions, 'prebuildTransaction');
+
     const { blockhash: bh } = await this.getBlockhash();
     const priorityFee = await this.getDynamicPriorityFee();
 
@@ -1231,10 +1237,9 @@ export class UltraTxEngine {
         }
 
         // Concurrency guard — same as submitTransaction
-        if (this.submitInProgress) {
-          throw new Error('Another transaction is already in progress. Wait for it to complete.');
+        if (this.submitInProgressPromise) {
+          return this.submitInProgressPromise;
         }
-        this.submitInProgress = true;
 
         try {
           const pipelineStart = Date.now();
@@ -1298,7 +1303,7 @@ export class UltraTxEngine {
             metrics,
           };
         } finally {
-          this.submitInProgress = false;
+          this.submitInProgressPromise = null;
         }
       },
     };

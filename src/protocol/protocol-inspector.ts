@@ -370,10 +370,21 @@ export class ProtocolInspector {
       fetchFailed = true;
     }
 
-    // If both fetches failed and we have stale cache, return it rather than empty data
-    if (fetchFailed && openInterest.length === 0 && !overviewStats && this.cache) {
-      logger.debug('PROTOCOL', 'Using stale cache as fallback');
-      return this.cache;
+    // If one fetch failed but we have stale cache, fill in the failed portion from cache
+    if (fetchFailed && this.cache) {
+      if (openInterest.length === 0 && this.cache.openInterest.length > 0) {
+        logger.debug('PROTOCOL', 'Using stale cache for OI data');
+        openInterest = this.cache.openInterest;
+      }
+      if (!overviewStats && this.cache.overviewStats) {
+        logger.debug('PROTOCOL', 'Using stale cache for overview stats');
+        overviewStats = this.cache.overviewStats;
+      }
+      // If both still empty after cache backfill, return full stale cache
+      if (openInterest.length === 0 && !overviewStats) {
+        logger.debug('PROTOCOL', 'Using full stale cache as fallback');
+        return this.cache;
+      }
     }
 
     this.cache = {

@@ -238,13 +238,20 @@ export async function getProtocolFeeRates(market: string, perpClient: unknown | 
     }
   }
 
-  // No perpClient available (simulation mode) or RPC fetch failed — use conservative defaults
-  // clearly marked as non-authoritative
+  // H8: Per-market defaults for known markets; generic fallback for unknown
+  const MARKET_DEFAULTS: Record<string, Partial<ProtocolFeeRates>> = {
+    SOL: { openFeeRate: 0.0008, closeFeeRate: 0.0008, maintenanceMarginRate: 0.01, maxLeverage: 100 },
+    BTC: { openFeeRate: 0.0006, closeFeeRate: 0.0006, maintenanceMarginRate: 0.005, maxLeverage: 100 },
+    ETH: { openFeeRate: 0.0006, closeFeeRate: 0.0006, maintenanceMarginRate: 0.005, maxLeverage: 100 },
+    BONK: { openFeeRate: 0.001, closeFeeRate: 0.001, maintenanceMarginRate: 0.02, maxLeverage: 50 },
+    WIF: { openFeeRate: 0.001, closeFeeRate: 0.001, maintenanceMarginRate: 0.02, maxLeverage: 50 },
+  };
+  const marketDefaults = MARKET_DEFAULTS[upper] ?? {};
   const defaultRates: ProtocolFeeRates = {
-    openFeeRate: 0.0008,
-    closeFeeRate: 0.0008,
-    maintenanceMarginRate: 0.01,
-    maxLeverage: 100,
+    openFeeRate: marketDefaults.openFeeRate ?? 0.0008,
+    closeFeeRate: marketDefaults.closeFeeRate ?? 0.0008,
+    maintenanceMarginRate: marketDefaults.maintenanceMarginRate ?? 0.01,
+    maxLeverage: marketDefaults.maxLeverage ?? 100,
     source: 'sdk-default',
   };
   feeCache.set(upper, { rates: defaultRates, cachedAtSlot: 0 });

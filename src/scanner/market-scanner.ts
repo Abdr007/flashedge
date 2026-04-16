@@ -200,7 +200,9 @@ export class MarketScanner {
 
     // Total volume per market from daily data
     const totalVolumeByMarket = new Map<string, number>();
-    // Use 24h volume from last day as proxy for total
+    // Approximation: per-market volume is not available from the aggregated daily data,
+    // so we distribute the total 24h volume equally across valid markets.
+    // If individual market volume becomes available, use it instead.
     const lastDayVol =
       volume.dailyVolumes.length > 0 ? volume.dailyVolumes[volume.dailyVolumes.length - 1].volumeUsd : 0;
     for (const m of validMarkets) {

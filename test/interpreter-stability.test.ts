@@ -61,18 +61,16 @@ describe('Open Command Parsing', () => {
 // ─── Command Aliases ─────────────────────────────────────────────────────────
 
 describe('Command Aliases', () => {
-  it('should expand "o" to "open"', () => {
+  // C7 safety: single-char trade aliases (o/c/l/s) were removed to prevent accidental trades
+  it('should NOT expand "o" (removed for safety)', () => {
     const r = localParse('o 2x long SOL $100') as ParseResult;
-    expect(r).not.toBeNull();
-    expect(r!.action).toBe(ActionType.OpenPosition);
-    expect(r!.market).toBe('SOL');
+    // "o" is no longer an alias — must use "open" explicitly
+    expect(r).toBeNull();
   });
 
-  it('should expand "c" to "close"', () => {
+  it('should NOT expand "c" (removed for safety)', () => {
     const r = localParse('c SOL long') as ParseResult;
-    expect(r).not.toBeNull();
-    expect(r!.action).toBe(ActionType.ClosePosition);
-    expect(r!.market).toBe('SOL');
+    expect(r).toBeNull();
   });
 
   it('should expand "p" to "positions"', () => {
@@ -111,11 +109,10 @@ describe('Command Aliases', () => {
     expect(r!.action).toBe(ActionType.GetPortfolio);
   });
 
-  it('should expand "c SOL long 50%" for partial close alias', () => {
+  // C7 safety: "c" alias removed — must use "close" explicitly
+  it('should NOT expand "c SOL long 50%" (removed for safety)', () => {
     const r = localParse('c SOL long 50%') as ParseResult;
-    expect(r).not.toBeNull();
-    expect(r!.action).toBe(ActionType.ClosePosition);
-    expect(r!.closePercent).toBe(50);
+    expect(r).toBeNull();
   });
 });
 

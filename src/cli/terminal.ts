@@ -917,8 +917,9 @@ export class FlashTerminal {
       process.exitCode = 1;
     }
 
-    // Cleanup
+    // L5: Cleanup before exit to flush state
     this.rl.close();
+    await this.shutdown();
     process.exit(process.exitCode ?? 0);
   }
 
@@ -1827,6 +1828,12 @@ export class FlashTerminal {
   // ─── Command Handler ──────────────────────────────────────────────
 
   private async handleInput(rawInput: string): Promise<void> {
+    // M14: Reject trade commands during wallet rebuild
+    if (this.walletRebuilding) {
+      console.log(chalk.dim('  Wallet reconnecting, please wait...'));
+      return;
+    }
+
     // Signal user activity to runtime state machine
     getRuntimeState()?.markActive();
 

@@ -22,6 +22,7 @@
 import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
+import { randomUUID } from 'crypto';
 import { getLogger } from '../utils/logger.js';
 
 const JOURNAL_DIR = join(homedir(), '.flash');
@@ -84,7 +85,7 @@ export class TradeJournal {
     leverage?: number;
     sizeUsd?: number;
   }): string {
-    const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const id = randomUUID();
     const now = Date.now();
 
     const entry: JournalEntry = {

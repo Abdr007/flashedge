@@ -128,7 +128,8 @@ function fuzzySide(token: string): string | null {
   if (token === 'long' || token === 'short') return token;
   const sides = ['long', 'short'];
   for (const s of sides) {
-    if (editDistance(token, s) <= 2) return s;
+    // C7: tighten to distance ≤1 to prevent accidental side corrections ("shirt"→"short")
+    if (editDistance(token, s) <= 1) return s;
   }
   return null;
 }
@@ -144,10 +145,10 @@ function fuzzyMarket(token: string): string | null {
     const maxDist = m.length <= 3 ? 1 : 2;
     if (editDistance(token, m.toLowerCase()) <= maxDist) return m;
   }
-  // Try against market aliases (longer names → distance 2 allowed)
+  // Try against market aliases — C7: tighten to distance ≤1 to prevent accidental market corrections
   const aliases = getMarketAliases();
   for (const [alias, symbol] of aliases) {
-    if (editDistance(token, alias) <= 2) return symbol;
+    if (editDistance(token, alias) <= 1) return symbol;
   }
   return null;
 }
@@ -423,11 +424,9 @@ function normalizeAssetAliases(text: string): string {
 // ─── Command Aliases ──────────────────────────────────────────────────────
 // Short aliases expand to full command prefixes before parsing.
 // Only applied when the alias is the first token.
+// C7: removed dangerous single-char trade aliases (o/c/l/s) and "ca" (close all)
+// to prevent accidental trades from typos. Safe non-trade aliases kept.
 const COMMAND_ALIASES: Record<string, string> = {
-  o: 'open',
-  c: 'close',
-  l: 'long',
-  s: 'short',
   p: 'positions',
   pos: 'positions',
   m: 'monitor',
@@ -435,7 +434,6 @@ const COMMAND_ALIASES: Record<string, string> = {
   d: 'dashboard',
   b: 'portfolio', // "b" for balance
   bal: 'portfolio',
-  ca: 'close all',
   buy: 'open', // "buy sol 2x 10" → "open sol 2x 10"
   sell: 'close', // "sell sol" → "close sol"
 };
@@ -1036,7 +1034,8 @@ export function localParse(input: string): ParsedIntent | null {
     const reverseMatch = lower.match(/^(?:reverse|flip)\s+(?:position\s+)?([a-z]+)(?:\s+(long|short))?$/);
     if (reverseMatch) {
       const market = reverseMatch[1].toUpperCase();
-      const side = reverseMatch[2] ?? 'long'; // default to long if not specified
+      // M18: Default to 'long' if not specified — tool will auto-detect from positions
+      const side = reverseMatch[2] ?? 'long';
       return { action: ActionType.ReversePosition, market, side };
     }
   }

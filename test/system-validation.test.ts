@@ -127,8 +127,7 @@ describe('Natural Language Parsing', () => {
     ['solan long 2x 10', 'open_position', 'SOL'],    // typo
     ['lonng sol 2x 10', 'open_position', 'SOL'],     // typo
     ['sol-perp long 2x 10', 'open_position', 'SOL'], // symbol variant
-    ['l sol 2x 10', 'open_position', 'SOL'],          // alias
-    ['s btc 3x 50', 'open_position', 'BTC'],          // alias
+    // C7: 'l' and 's' aliases removed for safety — use 'long'/'short' explicitly
   ];
 
   for (const [input, action, market] of nlpTests) {

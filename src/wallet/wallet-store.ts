@@ -321,6 +321,8 @@ export class WalletStore {
         const filePath = join(LEGACY_WALLETS_DIR, file);
 
         try {
+          // M17: Validate legacy file paths through the same security checks
+          try { this.validateWalletPath(filePath); } catch { continue; }
           let raw = readFileSync(filePath, 'utf-8');
           const secretKey = JSON.parse(raw);
           raw = '';

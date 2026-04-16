@@ -80,32 +80,41 @@ import { getP95Latency, persistExecution } from '../observability/execution-stor
 // The Flash SDK has debug console.log statements in its published build.
 // Suppress them during SDK calls to keep terminal output clean.
 
+// Capture original console.log ONCE at module scope — immune to concurrent suppression races (M2)
+const _origConsoleLog = console.log;
+let _suppressionDepth = 0;
+
 async function quietSdk<T>(fn: () => Promise<T>): Promise<T> {
-  const origLog = console.log;
-  console.log = (...args: unknown[]) => {
-    const first = typeof args[0] === 'string' ? args[0] : '';
-    if (
-      first.includes('close position') ||
-      first.includes('SDK logs') ||
-      first.includes('volitlity fee') ||
-      first.includes('assetsUsd') ||
-      first.includes('collateralSymbol === SOL') ||
-      first.includes('inputSymbol === SOL') ||
-      first.includes('maxWithdrawableAmount') ||
-      first.includes('collateralAmountReceived') ||
-      first.includes('exceeding to') ||
-      first.includes('profitLoss') ||
-      first.includes('THIS cannot') ||
-      first.includes('No account info found')
-    ) {
-      return;
-    }
-    origLog.apply(console, args);
-  };
+  _suppressionDepth++;
+  if (_suppressionDepth === 1) {
+    console.log = (...args: unknown[]) => {
+      const first = typeof args[0] === 'string' ? args[0] : '';
+      if (
+        first.includes('close position') ||
+        first.includes('SDK logs') ||
+        first.includes('volitlity fee') ||
+        first.includes('assetsUsd') ||
+        first.includes('collateralSymbol === SOL') ||
+        first.includes('inputSymbol === SOL') ||
+        first.includes('maxWithdrawableAmount') ||
+        first.includes('collateralAmountReceived') ||
+        first.includes('exceeding to') ||
+        first.includes('profitLoss') ||
+        first.includes('THIS cannot') ||
+        first.includes('No account info found')
+      ) {
+        return;
+      }
+      _origConsoleLog.apply(console, args);
+    };
+  }
   try {
     return await fn();
   } finally {
-    console.log = origLog;
+    _suppressionDepth--;
+    if (_suppressionDepth === 0) {
+      console.log = _origConsoleLog;
+    }
   }
 }
 
@@ -402,7 +411,7 @@ let ALLOWED_PROGRAM_IDS: ReadonlySet<string> = BASE_ALLOWED_PROGRAM_IDS;
  * Validate that every instruction in a transaction targets an approved program.
  * Throws if any instruction uses an unknown program ID.
  */
-function validateInstructionPrograms(instructions: TransactionInstruction[], context: string): void {
+export function validateInstructionPrograms(instructions: TransactionInstruction[], context: string): void {
   for (let i = 0; i < instructions.length; i++) {
     const progId = instructions[i].programId.toBase58();
     if (!ALLOWED_PROGRAM_IDS.has(progId)) {
@@ -426,6 +435,7 @@ export class FlashClient implements IFlashClient {
   private config: FlashConfig;
   private walletMgr: WalletManager;
   private cachedSolBalance = 0;
+  private _cachedApiPriceService: InstanceType<typeof import('../data/prices.js').PriceService> | null = null;
 
   /** [M-4] Instance-level allowed program IDs */
   private allowedPrograms: Set<string>;
@@ -445,7 +455,7 @@ export class FlashClient implements IFlashClient {
   private cachedBlockhash: { blockhash: string; lastValidBlockHeight: number; fetchedAt: number } | null = null;
   private blockhashTimer: ReturnType<typeof setInterval> | null = null;
   private static readonly BLOCKHASH_REFRESH_MS = 5_000;
-  private static readonly BLOCKHASH_MAX_AGE_MS = 10_000;
+  private static readonly BLOCKHASH_MAX_AGE_MS = 5_000;
 
   constructor(connection: Connection, walletManager: WalletManager, config: FlashConfig) {
     this.config = config;
@@ -1215,7 +1225,10 @@ export class FlashClient implements IFlashClient {
             effectiveCuLimit = dynamicLimit;
             // Rebuild transaction with tighter CU limit (no extra RPC call)
             const tightCuLimitIx = ComputeBudgetProgram.setComputeUnitLimit({ units: effectiveCuLimit });
-            const tightIxs = [tightCuLimitIx, cuPriceIx, ...validatedInstructions];
+            // C2 fix: preserve Ed25519 instruction ordering for backup oracle validation
+            const ed25519Ixs = validatedInstructions.filter((ix) => ix.programId.toBase58() === ED25519_PROGRAM);
+            const nonEd25519Ixs = validatedInstructions.filter((ix) => ix.programId.toBase58() !== ED25519_PROGRAM);
+            const tightIxs = [...ed25519Ixs, tightCuLimitIx, cuPriceIx, ...nonEd25519Ixs];
             const tightMessage = MessageV0.compile({
               payerKey: this.wallet.publicKey,
               instructions: tightIxs,
@@ -1438,10 +1451,15 @@ export class FlashClient implements IFlashClient {
         // fire-and-forget (no new Connection objects — uses fetch directly to avoid socket leaks).
         const endpoints = rpcMgr.getEndpoints();
 
-        // Fire-and-forget to backup endpoints (no awaited Connection objects, no socket leaks)
+        // Fire-and-forget to backup endpoints via raw fetch — avoids Connection socket leaks (H5)
         for (let i = 1; i < endpoints.length; i++) {
-          const backupConn = new Connection(endpoints[i].url, { commitment: 'confirmed' });
-          backupConn.sendRawTransaction(signedBytes, { skipPreflight: true, maxRetries: 1 }).catch(() => {});
+          const body = JSON.stringify({
+            jsonrpc: '2.0', id: 1, method: 'sendTransaction',
+            params: [Buffer.from(signedBytes).toString('base64'), { encoding: 'base64', skipPreflight: true, maxRetries: 1 }],
+          });
+          fetch(endpoints[i].url, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body,
+          }).catch(() => {});
         }
 
         // Primary endpoint is always awaited
@@ -1574,13 +1592,17 @@ export class FlashClient implements IFlashClient {
       });
     }
 
-    // 5. Known program ID check (warn-only, non-blocking)
+    // 5. Known program ID check — every instruction must target an allowed program (H1: was warn-only)
     const accountKeys = staticKeys.map((k) => k.toBase58());
-    const hasKnownProgram = accountKeys.some((k) => ALLOWED_PROGRAM_IDS.has(k));
-    if (!hasKnownProgram) {
-      logger.warn('TX-VALIDATE',
-        `No known program IDs in tx for ${action} — accounts: ${accountKeys.slice(0, 5).join(', ')}...`,
-      );
+    for (const cix of msg.compiledInstructions) {
+      const progKey = accountKeys[cix.programIdIndex];
+      if (!progKey || !ALLOWED_PROGRAM_IDS.has(progKey)) {
+        throw new ExecutionError(
+          `Transaction rejected: instruction targets unknown program ${progKey ?? `index=${cix.programIdIndex}`} (${action}). ` +
+            `Only approved Flash Trade and Solana system programs are allowed.`,
+          { action, errorCode: 'TX_VALIDATION_FAILED' },
+        );
+      }
     }
 
     // 6. Byte size check (debug-only, non-blocking)
@@ -1936,7 +1958,11 @@ export class FlashClient implements IFlashClient {
       if (!apiPositions || apiPositions.length === 0) return apiPositions ? [] : null;
 
       // Fetch current prices to compute mark price (API positions don't include it)
-      const priceService = new (await import('../data/prices.js')).PriceService();
+      // L6: Cache PriceService instance to avoid creating new one per call
+      if (!this._cachedApiPriceService) {
+        this._cachedApiPriceService = new (await import('../data/prices.js')).PriceService();
+      }
+      const priceService = this._cachedApiPriceService;
       const symbols = apiPositions.map((ap) => String(ap.marketSymbol ?? '')).filter(Boolean);
       const priceMap = symbols.length > 0 ? await priceService.getPrices(symbols) : new Map();
 

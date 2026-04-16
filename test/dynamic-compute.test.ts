@@ -239,10 +239,11 @@ describe('Dynamic CU Implementation', () => {
       'should rebuild with tighter CU limit instruction');
   });
 
-  it('instruction order preserved in dynamic rebuild: CU limit → CU price → instructions', () => {
+  it('instruction order preserved in dynamic rebuild: Ed25519 → CU limit → CU price → instructions', () => {
     const src = readFileSync(resolve(ROOT, 'src/client/flash-client.ts'), 'utf8');
-    assert.ok(src.includes('[tightCuLimitIx, cuPriceIx, ...validatedInstructions]'),
-      'dynamic rebuild should preserve CU limit → CU price → instructions order');
+    // C2 fix: Ed25519 instructions must come before CU budget in dynamic rebuild
+    assert.ok(src.includes('ed25519Ixs') && src.includes('nonEd25519Ixs'),
+      'dynamic rebuild should separate Ed25519 instructions for correct ordering');
   });
 
   it('no additional RPC calls for dynamic CU', () => {

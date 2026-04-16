@@ -129,7 +129,7 @@ export class FlashSDK {
 
   /** Open a new position. Returns trade details (may require confirmation in interactive mode). */
   async open(params: OpenParams): Promise<FlashResponse<TradeResult>> {
-    const parts = [params.side, params.market, `${params.leverage}x`, `$${params.collateral}`];
+    const parts = ['open', params.side, params.market, `${params.leverage}x`, `$${params.collateral}`];
     if (params.tp) parts.push(`tp $${params.tp}`);
     if (params.sl) parts.push(`sl $${params.sl}`);
     return this.execute<TradeResult>(parts.join(' '));
@@ -371,6 +371,7 @@ export class FlashSDK {
     let running = true;
     let iteration = 0;
     let lastHash = '';
+    let consecutiveFailures = 0;
 
     const loop = async (): Promise<void> => {
       while (running) {
@@ -382,6 +383,7 @@ export class FlashSDK {
         try {
           const response = await this.executeRaw<T>(command);
           iteration++;
+          consecutiveFailures = 0;
 
           if (deduplicate) {
             const hash = JSON.stringify(response.data);
@@ -393,8 +395,16 @@ export class FlashSDK {
           }
 
           callback(response, iteration);
-        } catch {
-          // Swallow errors in watch loop — continue polling
+        } catch (err: unknown) {
+          consecutiveFailures++;
+          if (consecutiveFailures >= 5) {
+            // Too many consecutive failures — stop the watch loop
+            if (options.onError) {
+              options.onError(err instanceof Error ? err : new Error(String(err)), consecutiveFailures);
+            }
+            running = false;
+            break;
+          }
         }
 
         await sleep(interval);
@@ -457,7 +467,8 @@ export class FlashSDK {
                 // stdout is not valid JSON — report the process error
               }
             }
-            return reject(new FlashProcessError(command, error.code ? parseInt(String(error.code)) : null, stderr || error.message));
+            const exitCode = typeof error.code === 'number' ? error.code : (typeof error.code === 'string' && /^\d+$/.test(error.code) ? parseInt(error.code, 10) : null);
+            return reject(new FlashProcessError(command, exitCode, stderr || error.message));
           }
           resolve(stdout.trim());
         },
@@ -477,9 +488,25 @@ export class FlashSDK {
     }
 
     // Find the last complete JSON object in stdout
-    // (in case there's any stray output before the JSON)
-    const jsonStart = raw.lastIndexOf('\n{');
-    const jsonStr = jsonStart >= 0 ? raw.slice(jsonStart + 1) : raw;
+    // Search from end for the last complete {...} block
+    let jsonStr = raw;
+    const lastBrace = raw.lastIndexOf('}');
+    if (lastBrace >= 0) {
+      // Walk backwards to find the matching opening brace
+      let depth = 0;
+      let startIdx = -1;
+      for (let i = lastBrace; i >= 0; i--) {
+        if (raw[i] === '}') depth++;
+        else if (raw[i] === '{') depth--;
+        if (depth === 0) {
+          startIdx = i;
+          break;
+        }
+      }
+      if (startIdx >= 0) {
+        jsonStr = raw.slice(startIdx, lastBrace + 1);
+      }
+    }
 
     try {
       const parsed = JSON.parse(jsonStr);

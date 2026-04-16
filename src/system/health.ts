@@ -266,9 +266,7 @@ class HealthMonitorImpl implements HealthMonitor {
   recordError(): void {
     this.errorTimestamps.push(Date.now());
     const cutoff = Date.now() - 60_000;
-    while (this.errorTimestamps.length > 0 && this.errorTimestamps[0] < cutoff) {
-      this.errorTimestamps.shift();
-    }
+    this.errorTimestamps = this.errorTimestamps.filter((t) => t >= cutoff);
   }
 
   recordRpcLatency(ms: number): void {
@@ -517,9 +515,7 @@ class HealthMonitorImpl implements HealthMonitor {
 
   private getErrorRate(): number {
     const cutoff = Date.now() - 60_000;
-    while (this.errorTimestamps.length > 0 && this.errorTimestamps[0] < cutoff) {
-      this.errorTimestamps.shift();
-    }
+    this.errorTimestamps = this.errorTimestamps.filter((t) => t >= cutoff);
     return this.errorTimestamps.length;
   }
 

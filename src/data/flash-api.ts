@@ -547,9 +547,12 @@ async function flashApiFetch<T>(
         if (res.status === 429) {
           logger.info('FLASH-API', `Rate limited (429) for ${path}`);
         }
-        cb.recordFailure();
+        // M4: Only record circuit breaker failure for 5xx server errors, not 4xx client errors
+        if (res.status >= 500) {
+          cb.recordFailure();
+        }
         logger.info('FLASH-API', `${res.status}: ${res.statusText} for ${path}`);
-        return null; // API error — no retry
+        return null;
       }
 
       // Size guard

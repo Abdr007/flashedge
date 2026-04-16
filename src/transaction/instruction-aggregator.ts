@@ -21,6 +21,8 @@ export interface InstructionBatch {
   instructions: TransactionInstruction[];
   additionalSigners: Signer[];
   labels: string[];
+  /** H3: Track instruction count per label for correct splitting */
+  ixCountPerLabel: number[];
 }
 
 export interface SdkResult {
@@ -37,7 +39,7 @@ const SAFE_TX_SIZE = 1180;
 
 /** Create an empty instruction batch. */
 export function createBatch(): InstructionBatch {
-  return { instructions: [], additionalSigners: [], labels: [] };
+  return { instructions: [], additionalSigners: [], labels: [], ixCountPerLabel: [] };
 }
 
 /**
@@ -47,6 +49,7 @@ export function createBatch(): InstructionBatch {
 export function appendToBatch(batch: InstructionBatch, result: SdkResult, label: string): void {
   batch.instructions.push(...result.instructions);
   batch.labels.push(label);
+  batch.ixCountPerLabel.push(result.instructions.length);
 
   // Deduplicate signers by pubkey
   const existingKeys = new Set(batch.additionalSigners.map((s) => s.publicKey.toBase58()));
@@ -102,32 +105,24 @@ export function splitBatch(batch: InstructionBatch): [InstructionBatch, Instruct
     return [batch, createBatch()];
   }
 
-  // Count instructions per label by tracking insertion order
-  // The first label's instructions go into primary, rest into secondary
+  // H3 fix: Split using tracked ixCountPerLabel
+  const firstLabelIxCount = batch.ixCountPerLabel[0] ?? batch.instructions.length;
   const _primary = createBatch();
   const _secondary = createBatch();
 
-  // Find where the first label's instructions end
-  // Each SDK result may produce multiple instructions, so we track by
-  // counting unique label transitions
-  const _currentLabelIdx = 0;
-  const _ixIdx = 0;
+  _primary.instructions = batch.instructions.slice(0, firstLabelIxCount);
+  _primary.labels = [batch.labels[0]];
+  _primary.ixCountPerLabel = [firstLabelIxCount];
 
-  // We need to know how many instructions each label contributed.
-  // Since labels are pushed once per appendToBatch call, we track the ix boundaries.
-  // Simpler approach: first label = instructions from the first SDK result only.
-  // We store the instruction count per label in the batch structure.
-  // For simplicity, just put first label's result into primary.
-  // This works because the first call is always 'open' with known instruction count.
+  _secondary.instructions = batch.instructions.slice(firstLabelIxCount);
+  _secondary.labels = batch.labels.slice(1);
+  _secondary.ixCountPerLabel = batch.ixCountPerLabel.slice(1);
 
-  // Actually, let's just use a simpler split: find the boundary by re-examining
-  // that the open position instructions are always first.
-  // Use labels array: each label corresponds to one appendToBatch call.
-  // We need per-label instruction counts, which we don't track.
-  //
-  // Simplest correct approach: return the full batch as primary and empty secondary
-  // if we can't determine the split point. The caller handles the fallback.
-  return [batch, createBatch()];
+  // Signers: both batches get all signers (dedup is already done)
+  _primary.additionalSigners = [...batch.additionalSigners];
+  _secondary.additionalSigners = [...batch.additionalSigners];
+
+  return [_primary, _secondary];
 }
 
 /** Get a human-readable summary of the batch contents. */

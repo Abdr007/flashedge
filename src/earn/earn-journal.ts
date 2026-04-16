@@ -19,22 +19,28 @@ export interface EarnJournalEntry {
 const JOURNAL_FILE = join(homedir(), '.flash', 'earn-journal.json');
 const MAX_ENTRIES = 5000;
 
+// Simple write mutex to prevent concurrent file writes
+let _writeLock: Promise<void> = Promise.resolve();
+
 /** Append an earn action to the journal. */
 export function recordEarnAction(entry: EarnJournalEntry): void {
-  try {
-    const dir = join(homedir(), '.flash');
-    if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
+  // Serialize writes through a Promise latch to prevent concurrent file access
+  _writeLock = _writeLock.then(() => {
+    try {
+      const dir = join(homedir(), '.flash');
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
 
-    const entries = getEarnJournal();
-    entries.push(entry);
+      const entries = getEarnJournal();
+      entries.push(entry);
 
-    // Cap journal size
-    while (entries.length > MAX_ENTRIES) entries.shift();
+      // Cap journal size
+      while (entries.length > MAX_ENTRIES) entries.shift();
 
-    writeFileSync(JOURNAL_FILE, JSON.stringify(entries, null, 2), { mode: 0o600 });
-  } catch {
-    /* non-critical — don't break transactions */
-  }
+      writeFileSync(JOURNAL_FILE, JSON.stringify(entries, null, 2), { mode: 0o600 });
+    } catch {
+      /* non-critical — don't break transactions */
+    }
+  }).catch(() => { /* ensure chain never breaks */ });
 }
 
 /** Read all journal entries. */
