@@ -2362,7 +2362,7 @@ export class FlashTerminal {
       'tp', 'sl', 'take-profit', 'stop-loss',
       'limit', 'cancel-limit', 'cancel-tp', 'cancel-sl', 'liquidate',
       'history', 'journal', 'dashboard', 'dash', 'watch',
-      'er', 'er-health', 'health',
+      'er', 'er-health', 'health', 'alerts',
       'deposit', 'withdraw', 'settle',
       'vault', 'balance', 'portfolio', 'verify', 'parity',
       'price', 'markets', 'status', 'inspect', 'delegation', 'delegated',
@@ -2553,6 +2553,11 @@ export class FlashTerminal {
           case 'er-health':
           case 'health':
             return { tool: 'magicErHealth', params: {} };
+          case 'alerts': {
+            const action = (parts[1] ?? 'status').toLowerCase();
+            if (!['on', 'off', 'status'].includes(action)) return { error: 'usage: magic alerts <on|off|status>' };
+            return { tool: 'magicAlerts', params: { action } };
+          }
           case 'watch': {
             // magic watch — handled inline (TUI loop), not as a tool
             return { tool: '__magicWatch', params: {} };

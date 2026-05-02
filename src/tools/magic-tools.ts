@@ -20,6 +20,7 @@ import { MagicTradeClient } from '../client/magic-client.js';
 import { formatPrice, formatUsd } from '../utils/format.js';
 import { readMagicHistory, recordMagicTrade } from '../security/magic-history.js';
 import { startErHealthMonitor, getErHealthMonitor } from '../monitor/magic-er-health.js';
+import { startMagicAlerts, stopMagicAlerts, getMagicAlerts } from '../monitor/magic-alerts.js';
 
 /** Truncate a long base58 string for display: "5oZL8a…m9KJ". */
 function shortSig(s: string): string {
@@ -1181,6 +1182,45 @@ export const magicErHealth: ToolDefinition = {
   },
 };
 
+export const magicAlerts: ToolDefinition = {
+  name: 'magicAlerts',
+  description: 'Toggle Telegram/Discord liq-risk alerts. args: action (on|off|status).',
+  parameters: z.object({ action: z.enum(['on', 'off', 'status']) }),
+  async execute(params, context): Promise<ToolResult> {
+    const action = params.action as 'on' | 'off' | 'status';
+    if (action === 'status') {
+      const mon = getMagicAlerts();
+      if (!mon) return { success: true, message: chalk.dim('  alerts: off') };
+      const snap = mon.snapshot();
+      const lines = ['', chalk.cyan('  📡 Magic Alerts'), chalk.dim('  ─────────────────────────────────────')];
+      lines.push(`  Outbound: ${mon.hasOutbound() ? chalk.green('configured') : chalk.yellow('NO webhooks set')}`);
+      lines.push(`  Tracked positions: ${snap.length}`);
+      for (const s of snap) {
+        const lvl = s.level === 'CRITICAL' ? chalk.red(s.level) : s.level === 'WARNING' ? chalk.yellow(s.level) : chalk.green(s.level);
+        lines.push(`    ${chalk.bold(s.key.padEnd(14))} ${lvl}  distance=${(s.lastDistance * 100).toFixed(1)}%`);
+      }
+      lines.push('');
+      return { success: true, message: lines.join('\n') };
+    }
+    if (action === 'off') {
+      stopMagicAlerts();
+      return { success: true, message: chalk.dim('  alerts stopped') };
+    }
+    // action === 'on'
+    const client = buildMagicClient(context);
+    const mon = startMagicAlerts(client);
+    if (!mon.hasOutbound()) {
+      return {
+        success: true,
+        message:
+          chalk.yellow('  alerts started, but no webhooks are configured.\n') +
+          chalk.dim('  Set MAGIC_ALERTS_TG_BOT_TOKEN + MAGIC_ALERTS_TG_CHAT_ID,\n  and/or MAGIC_ALERTS_DISCORD_WEBHOOK in your .env.'),
+      };
+    }
+    return { success: true, message: chalk.green('  alerts started — webhooks configured. Will fire on WARNING / CRITICAL liq distance.') };
+  },
+};
+
 /** Helper used by other magic tools to journal trades. */
 export function journalMagicTrade(
   context: ToolContext,
@@ -1233,5 +1273,6 @@ export const magicTools: ToolDefinition[] = [
   magicHistory,
   magicDashboard,
   magicErHealth,
+  magicAlerts,
   magicFaucet,
 ];
