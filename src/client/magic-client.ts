@@ -689,14 +689,31 @@ export class MagicTradeClient implements IFlashClient {
   }
 
   /**
-   * Settle a custody's pending credits/debits on the ER — moves matched entries
-   * off the basket and into the UDL deposit balance. Without this, a closed
-   * position's payout sits in `pendingCredits` and isn't usable for new trades.
-   * Sent to the ER (the basket dirt lives there, not on L1). Returns the sig.
+   * Settle a custody's pending credits/debits — TWO-STEP flow:
+   *   1. L1: requestCustodySettlementWithAction
+   *      Creates the settlementReceipt PDA and commits ER state to L1.
+   *   2. ER: processCustodySettlementEr
+   *      Reads the receipt and drains matched debit/credit pairs from the
+   *      basket into UDL deposits.
+   *
+   * Doing only step 2 fails with `AccountDiscriminatorNotFound` because the
+   * settlementReceipt doesn't exist yet — that's why my earlier single-step
+   * implementation always failed with InvalidWritableAccount.
+   *
+   * Returns the ER signature (the one that actually drains the balance).
    */
   async settleCustody(custodySymbol: string): Promise<string> {
-    const result = await this.sdk.processCustodySettlementEr(custodySymbol, this.poolConfig);
-    return this.sendErIxs(result.instructions, result.additionalSigners, `magic.settle.${custodySymbol}`);
+    // Step 1 — L1: create the settlementReceipt + commit ER state
+    const validatorKey = await this.fetchClosestValidatorKey().catch(() => this.wallet.publicKey);
+    const requestResult = await this.sdk.requestCustodySettlementWithAction(custodySymbol, this.poolConfig, {
+      commitFrequency: 300,
+      validatorKey,
+    });
+    await this.sendL1Ixs(requestResult.instructions, requestResult.additionalSigners, `magic.settleRequest.${custodySymbol}`);
+
+    // Step 2 — ER: process the receipt, drain the basket
+    const processResult = await this.sdk.processCustodySettlementEr(custodySymbol, this.poolConfig);
+    return this.sendErIxs(processResult.instructions, processResult.additionalSigners, `magic.settleProcess.${custodySymbol}`);
   }
 
   /**
