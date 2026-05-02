@@ -403,6 +403,7 @@ export class MagicTradeClient implements IFlashClient {
 
       const collateralCustody = this.poolConfig.getCustodyFromSymbol(collateralSymbol);
       const targetCustody = this.poolConfig.getCustodyFromSymbol(targetSymbol);
+      const lockCustody = this.poolConfig.getCustodyFromSymbol(lockSymbol);
       const collateralRaw = new BN(Math.floor(collateralAmount * 10 ** collateralCustody.decimals));
 
       // Compute size locally from on-chain oracle. We avoid getOpenPositionQuote
@@ -418,15 +419,49 @@ export class MagicTradeClient implements IFlashClient {
       }
       const sizeRaw = new BN(Math.floor((sizeUsd / oraclePrice) * 10 ** targetCustody.decimals));
 
-      const result = await this.sdk.openPosition(
-        targetSymbol,
-        lockSymbol,
-        collateralSymbol,
-        sdkSide,
-        this.poolConfig,
-        collateralRaw,
-        sizeRaw,
-      );
+      let result: { instructions: TransactionInstruction[]; additionalSigners: Signer[] };
+
+      if (collateralSymbol === lockSymbol) {
+        // Same-token path: user already deposited the lock token. Plain openPosition.
+        result = await this.sdk.openPosition(
+          targetSymbol,
+          lockSymbol,
+          collateralSymbol,
+          sdkSide,
+          this.poolConfig,
+          collateralRaw,
+          sizeRaw,
+        );
+      } else {
+        // Cross-token path: user is paying in `collateralSymbol` (e.g., USDC), but
+        // the market locks `lockSymbol` (e.g., SOL for SOL Long). The program needs
+        // its collateral in the lock token, so we use `swapAndOpenPosition` which
+        // bundles a swap + open in one ix.
+        //
+        // For SOL Long with $10 USDC at SOL=$84:
+        //   receivingAmount   = 10 USDC raw      (user's input)
+        //   collateralAmount  = 0.119 SOL raw    (= $10 of SOL post-swap)
+        //   sizeAmount        = 0.238 SOL raw    (= $20 of SOL = collateral × leverage)
+        const lockEquivRaw = new BN(
+          Math.floor((collateralAmount / oraclePrice) * 10 ** lockCustody.decimals),
+        );
+        // 1% slippage tolerance on the swap output — Flash's pool typically routes
+        // the trade with minimal slippage, but tighten/loosen via env var if needed.
+        const minTargetAmount = lockEquivRaw.muln(99).divn(100);
+        result = await this.sdk.swapAndOpenPosition(
+          targetSymbol,
+          collateralSymbol, // SDK calls this `receivingSymbol` — user's input token
+          lockSymbol,       // SDK calls this `collateralSymbol` — the lock
+          sdkSide,
+          this.poolConfig,
+          {
+            receivingAmount: collateralRaw,
+            minTargetAmount,
+            collateralAmount: lockEquivRaw,
+            sizeAmount: sizeRaw,
+          },
+        );
+      }
 
       const sig = await this.sendErIxs(result.instructions, result.additionalSigners, 'magic.openPosition');
       this.recordRecentTrade(cacheKey, sig);
