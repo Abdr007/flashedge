@@ -24,7 +24,7 @@ import { WalletStore } from '../wallet/wallet-store.js';
 import { shortAddress } from '../utils/format.js';
 import { getErrorMessage } from '../utils/retry.js';
 import { initLogger, getLogger, Logger, generateRequestId } from '../utils/logger.js';
-import { formatUsd } from '../utils/format.js';
+import { formatUsd, formatPrice } from '../utils/format.js';
 import { MarketRegime } from '../regime/regime-types.js';
 import { initSigningGuard } from '../security/signing-guard.js';
 import { RpcManager, buildRpcEndpoints, initRpcManager } from '../network/rpc-manager.js';
@@ -982,8 +982,8 @@ export class FlashTerminal {
     console.log('');
     console.log(theme.section('  Select Mode'));
     console.log('');
-    console.log(`    ${theme.command('1)')} ${theme.section('LIVE TRADING')}`);
-    console.log(theme.dim('       Execute real transactions on Flash Trade.'));
+    console.log(`    ${theme.command('1)')} ${theme.section('LIVE TRADING')} ${chalk.dim('(v1)')}`);
+    console.log(theme.dim('       Execute real transactions on Flash Trade L1.'));
     console.log('');
     console.log(`    ${theme.command('2)')} ${theme.section('SIMULATION')}`);
     console.log(theme.dim('       Test strategies using paper trading.'));
@@ -991,9 +991,9 @@ export class FlashTerminal {
     {
       const magicNet = (process.env.MAGIC_NETWORK ?? 'mainnet-beta').toLowerCase() === 'devnet' ? 'DEVNET' : 'MAINNET';
       const magicTag = magicNet === 'MAINNET' ? chalk.green(`[${magicNet}]`) : chalk.red(`[${magicNet}]`);
-      console.log(`    ${theme.command('3)')} ${theme.section('MAGIC TRADING')} ${magicTag}`);
+      console.log(`    ${theme.command('3)')} ${theme.section('MAGIC TRADING')} ${chalk.dim('(v2)')} ${magicTag}`);
     }
-    console.log(theme.dim('       Flash Magic Trade on MagicBlock ER — session-key UX, sub-50ms.'));
+    console.log(theme.dim('       Flash Magic Trade on MagicBlock ER — sub-second confirms.'));
     console.log('');
     console.log(`    ${theme.command('4)')} ${theme.dim('Exit')}`);
     console.log('');
@@ -2444,6 +2444,31 @@ export class FlashTerminal {
         console.log('');
         return;
       }
+      // ─── Preview + Y/N confirm before signing ────────────────────────
+      // Set MAGIC_AUTO_CONFIRM=true to skip (for power users / scripted flow).
+      const autoConfirm = (process.env.MAGIC_AUTO_CONFIRM ?? 'false').toLowerCase() === 'true';
+      const needsConfirm = !autoConfirm && ['magicOpen', 'magicClose', 'magicAddCollateral', 'magicRemoveCollateral', 'magicWithdraw'].includes(resolved.tool!);
+      if (needsConfirm) {
+        try {
+          const previewMsg = await this.buildMagicPreview(resolved.tool!, resolved.params!);
+          if (previewMsg) {
+            console.log(previewMsg);
+            const ok = await this.confirm('Execute?');
+            if (!ok) {
+              console.log(chalk.dim('  Cancelled.'));
+              return;
+            }
+          }
+        } catch (err) {
+          console.log(chalk.yellow(`  Preview failed (${(err as Error).message}) — proceeding without preview.`));
+          const ok = await this.confirm('Execute anyway?');
+          if (!ok) {
+            console.log(chalk.dim('  Cancelled.'));
+            return;
+          }
+        }
+      }
+
       try {
         const result = await this.engine.executeTool(resolved.tool!, resolved.params!);
         console.log(result.message);
@@ -3247,7 +3272,7 @@ export class FlashTerminal {
 
   /**
    * Print a compact execution timer after each command.
-   * Format: [153ms] or [7.4s]
+   * Format: ⚡ 0.34s — green (<0.5s), yellow (<2s), red (≥2s).
    */
   private renderExecutionTimer(): void {
     if (IS_AGENT) return; // NO_DNA: no TUI decorations
@@ -3257,10 +3282,11 @@ export class FlashTerminal {
     const skip = ['help', 'commands', '?', 'exit', 'quit'];
     if (skip.includes(this.lastCommand.toLowerCase())) return;
 
-    const timeStr =
-      this.lastCommandMs >= 1000 ? `${(this.lastCommandMs / 1000).toFixed(1)}s` : `${this.lastCommandMs}ms`;
-
-    console.log(theme.dim(`  [${timeStr}]`));
+    const ms = this.lastCommandMs;
+    const seconds = ms / 1000;
+    const timeStr = seconds < 1 ? `${seconds.toFixed(2)}s` : `${seconds.toFixed(1)}s`;
+    const color = ms < 500 ? chalk.green : ms < 2000 ? chalk.yellow : chalk.red;
+    console.log(`  ${color('⚡')} ${color(timeStr)}`);
   }
 
   // ─── Result Indicators ─────────────────────────────────────
@@ -3400,6 +3426,100 @@ export class FlashTerminal {
 
   // [L-11] Confirmation timeout — cancel trade if user doesn't respond within 2 minutes
   private static readonly CONFIRM_TIMEOUT_MS = 120_000;
+
+  /**
+   * Build a preview card for magic open/close/add/remove/withdraw before signing.
+   * For opens, runs the SDK's getOpenPositionQuote to show real entry/liq/size/fee.
+   * Returns null when the tool doesn't need a numeric preview (the param echo is enough).
+   */
+  private async buildMagicPreview(tool: string, params: Record<string, unknown>): Promise<string | null> {
+    const network = this.config?.magicNetwork ?? 'mainnet-beta';
+    const poolName = this.config?.magicPoolName ?? (network === 'mainnet-beta' ? 'Pool.0' : 'Pool.1');
+    const erEndpoint = this.config?.magicRpcUrl ?? 'https://flashtrade.magicblock.app/';
+    const l1Url = this.config?.magicL1RpcUrl ?? (network === 'mainnet-beta' ? 'https://api.mainnet-beta.solana.com' : 'https://api.devnet.solana.com');
+    const kp = this.walletManager?.getKeypair();
+    if (!kp) return null;
+    const { Connection } = await import('@solana/web3.js');
+    const { MagicTradeClient } = await import('../client/magic-client.js');
+    const client = new MagicTradeClient({
+      wallet: kp,
+      l1Connection: new Connection(l1Url, 'confirmed'),
+      network,
+      poolName,
+      erEndpoint,
+      programIdOverride: this.config?.magicProgramId,
+      fastConfirm: this.config?.magicFastConfirm ?? true,
+    });
+
+    const sep = chalk.dim('  ─────────────────────────────────────');
+    if (tool === 'magicOpen') {
+      const market = String(params.market).toUpperCase();
+      const side = String(params.side);
+      const collateral = Number(params.collateral);
+      const leverage = Number(params.leverage);
+      const collateralToken = params.collateralToken ? String(params.collateralToken).toUpperCase() : 'USDC';
+      const q = await client.previewOpen(market, side as TradeSide, collateral, leverage, collateralToken);
+      const liqStr = q.liquidationPrice > 0 ? chalk.yellow(`$${q.liquidationPrice.toFixed(4)}`) : chalk.dim('N/A');
+      const swapStr = q.swapRequired ? chalk.cyan(`(swap ${q.collateralSymbol}→${q.lockSymbol})`) : chalk.dim(`(direct, lock=${q.lockSymbol})`);
+      return [
+        '',
+        chalk.bold.cyan('  ⚡ Preview — Open Position'),
+        sep,
+        `  Market:            ${chalk.bold(market)} ${side === 'short' ? chalk.red(side) : chalk.green(side)} ${chalk.dim(`${leverage}x`)}  ${swapStr}`,
+        `  Pay:               ${formatUsd(collateral)} ${q.collateralSymbol}`,
+        `  Size:              ${chalk.bold(formatUsd(q.sizeUsd))}`,
+        `  Entry Price:       ${formatPrice(q.entryPrice)}`,
+        `  Liquidation:       ${liqStr}`,
+        `  Est. Fee:          ${chalk.dim(`$${q.feeUsd.toFixed(4)}`)}`,
+        sep,
+        '',
+      ].join('\n');
+    }
+    if (tool === 'magicClose') {
+      const market = String(params.market).toUpperCase();
+      const side = String(params.side);
+      const recv = params.receiveToken ? String(params.receiveToken).toUpperCase() : 'USDC';
+      return [
+        '',
+        chalk.bold.cyan('  ⚡ Preview — Close Position'),
+        sep,
+        `  Market:            ${chalk.bold(market)} ${side === 'short' ? chalk.red(side) : chalk.green(side)}`,
+        `  Receive in:        ${recv}`,
+        sep,
+        '',
+      ].join('\n');
+    }
+    if (tool === 'magicAddCollateral' || tool === 'magicRemoveCollateral') {
+      const op = tool === 'magicAddCollateral' ? 'Add' : 'Remove';
+      const market = String(params.market).toUpperCase();
+      const side = String(params.side);
+      const amount = Number(params.amount);
+      return [
+        '',
+        chalk.bold.cyan(`  ⚡ Preview — ${op} Collateral`),
+        sep,
+        `  Market:            ${chalk.bold(market)} ${side === 'short' ? chalk.red(side) : chalk.green(side)}`,
+        `  Amount:            ${formatUsd(amount)}`,
+        sep,
+        '',
+      ].join('\n');
+    }
+    if (tool === 'magicWithdraw') {
+      const token = String(params.token).toUpperCase();
+      const amount = Number(params.amount);
+      return [
+        '',
+        chalk.bold.cyan('  ⚡ Preview — Withdraw'),
+        sep,
+        `  Token:             ${chalk.bold(token)}`,
+        `  Amount:            ${amount} ${token}`,
+        chalk.dim('  Note: 2-step (L1 request + L1 settle) — ~1-2 seconds.'),
+        sep,
+        '',
+      ].join('\n');
+    }
+    return null;
+  }
 
   /** Confirmation via pendingConfirmation callback — auto-cancels after timeout */
   private confirm(prompt: string): Promise<boolean> {

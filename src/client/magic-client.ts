@@ -340,6 +340,64 @@ export class MagicTradeClient implements IFlashClient {
     return priceToNumber(result.entryPrice as { price: BN; exponent: number });
   }
 
+  /**
+   * Preview an open without signing. Returns the same numbers the trade card
+   * will show: entry, liq, size, collateral, fee, swap-required flag. Used
+   * for the Y/N confirm prompt so the user sees exactly what they're about to
+   * sign before any tx hits chain.
+   */
+  async previewOpen(
+    market: string,
+    side: TradeSide,
+    collateralAmount: number,
+    leverage: number,
+    collateralToken?: string,
+  ): Promise<{
+    targetSymbol: string;
+    lockSymbol: string;
+    collateralSymbol: string;
+    entryPrice: number;
+    liquidationPrice: number;
+    sizeUsd: number;
+    collateralUsd: number;
+    feeUsd: number;
+    swapRequired: boolean;
+  }> {
+    const targetSymbol = market.toUpperCase();
+    const collateralSymbol = (collateralToken ?? 'USDC').toUpperCase();
+    const sdkSide = side === TradeSide.Long ? Side.Long : Side.Short;
+    const { lockSymbol } = this.resolveMarket(targetSymbol, side);
+    const collateralCustody = this.poolConfig.getCustodyFromSymbol(collateralSymbol);
+    const collateralRaw = new BN(Math.floor(collateralAmount * 10 ** collateralCustody.decimals));
+    const leverageBps = new BN(Math.round(leverage * 10_000));
+
+    const quote = await this.sdk.getOpenPositionQuote(
+      targetSymbol,
+      lockSymbol,
+      sdkSide,
+      this.poolConfig,
+      collateralRaw,
+      leverageBps,
+      collateralSymbol,
+      null,
+      null,
+      null,
+      this.basketPda,
+    );
+
+    return {
+      targetSymbol,
+      lockSymbol,
+      collateralSymbol,
+      entryPrice: priceToNumber(quote.entryPrice as { price: BN; exponent: number }),
+      liquidationPrice: priceToNumber(quote.liquidationPrice as { price: BN; exponent: number }),
+      sizeUsd: Number((quote.sizeUsd as BN).toString()) / USD_POWER,
+      collateralUsd: Number((quote.collateralUsd as BN).toString()) / USD_POWER,
+      feeUsd: Number((quote.entryFeeUsd as BN).toString()) / USD_POWER,
+      swapRequired: Boolean(quote.swapRequired),
+    };
+  }
+
   // ─── IFlashClient: trades ──────────────────────────────────────────────────
 
   async openPosition(

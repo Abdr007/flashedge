@@ -16,6 +16,7 @@ import { ActionType } from '../types/index.js';
 
 export type CommandCategory =
   | 'Trading'
+  | 'Magic Trading'
   | 'Earn (Liquidity)'
   | 'FAF Token'
   | 'Market Data & Analytics'
@@ -110,6 +111,48 @@ export const COMMAND_REGISTRY: CommandEntry[] = [
     description: 'View recent trades',
     aliases: ['trades', 'journal', 'history'],
   },
+
+  // ── Magic Trading (MagicBlock ER, sub-second) ───────────────────────────
+  // Active when MAGIC TRADING mode is selected at startup.
+  { name: 'magic open', action: null, category: 'Magic Trading',
+    description: 'Open a position on the ER (sub-second confirm)',
+    helpFormat: 'magic open SOL short 10 2', parameterized: true },
+  { name: 'magic close', action: null, category: 'Magic Trading',
+    description: 'Close a position', helpFormat: 'magic close SOL short', parameterized: true },
+  { name: 'magic add', action: null, category: 'Magic Trading',
+    description: 'Add USD collateral to a position',
+    helpFormat: 'magic add SOL short 5', parameterized: true },
+  { name: 'magic remove', action: null, category: 'Magic Trading',
+    description: 'Remove USD collateral from a position',
+    helpFormat: 'magic remove SOL short 5', parameterized: true },
+  { name: 'magic deposit', action: null, category: 'Magic Trading',
+    description: 'Deposit token into the vault',
+    helpFormat: 'magic deposit USDC 50', parameterized: true },
+  { name: 'magic withdraw', action: null, category: 'Magic Trading',
+    description: 'Withdraw token from the vault',
+    helpFormat: 'magic withdraw USDC 50', parameterized: true },
+  { name: 'magic settle', action: null, category: 'Magic Trading',
+    description: 'Settle pending credits/debits in the basket',
+    helpFormat: 'magic settle [USDC]', parameterized: true },
+  { name: 'magic portfolio', action: null, category: 'Magic Trading',
+    description: 'Live portfolio (real PnL/markPrice/liq)' },
+  { name: 'magic verify', action: null, category: 'Magic Trading',
+    description: 'Confirm CLI/UI parity (same on-chain accounts)' },
+  { name: 'magic price', action: null, category: 'Magic Trading',
+    description: 'Quote current oracle price for a market',
+    helpFormat: 'magic price SOL', parameterized: true },
+  { name: 'magic markets', action: null, category: 'Magic Trading',
+    description: 'List all 52 markets with leverage caps' },
+  { name: 'magic status', action: null, category: 'Magic Trading',
+    description: 'Wallet preflight (SOL, UDL, basket, deposits)' },
+  { name: 'magic setup', action: null, category: 'Magic Trading',
+    description: 'One-time init: UDL + basket + delegate' },
+  { name: 'magic inspect', action: null, category: 'Magic Trading',
+    description: 'Show network, pool, program, custodies, markets' },
+  { name: 'magic delegation', action: null, category: 'Magic Trading',
+    description: 'Show basket delegation status' },
+  { name: 'magic faucet', action: null, category: 'Magic Trading',
+    description: 'Devnet SOL + test stable faucet links' },
 
   // ── Market Data & Analytics ─────────────────────────────────────────────
   {
@@ -864,6 +907,7 @@ export function resolveCategory(input: string): CommandCategory | undefined {
 /** Category order for help output */
 export const CATEGORY_ORDER: CommandCategory[] = [
   'Trading',
+  'Magic Trading',
   'Earn (Liquidity)',
   'FAF Token',
   'Market Data & Analytics',
