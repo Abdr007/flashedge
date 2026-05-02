@@ -692,6 +692,56 @@ export const magicPrice: ToolDefinition = {
 };
 
 /**
+ * Show the user's vault state per token: gross deposit, locked in positions,
+ * and what's actually available for new trades. Faster + more focused than
+ * `magic verify` which is the full audit view.
+ */
+export const magicVault: ToolDefinition = {
+  name: 'magicVault',
+  description: 'Show vault balance per token (deposits, locked, available).',
+  async execute(_params, context): Promise<ToolResult> {
+    const client = buildMagicClient(context);
+    const balances = await client.getAvailableBalances();
+    const sep = chalk.dim('  ─────────────────────────────────────');
+
+    if (balances.size === 0) {
+      return {
+        success: true,
+        message: [
+          '',
+          chalk.cyan('  💰 Vault'),
+          sep,
+          chalk.dim('  empty — run `magic deposit USDC <amount>` to fund'),
+          '',
+        ].join('\n'),
+      };
+    }
+
+    const lines: string[] = ['', chalk.cyan('  💰 Vault'), sep];
+    lines.push(
+      `  ${chalk.dim('Token').padEnd(8)}${chalk.dim('Deposits').padEnd(20)}${chalk.dim('Locked').padEnd(20)}${chalk.dim('Available')}`,
+    );
+    let totalAvailUsd = 0;
+    for (const [sym, bal] of balances) {
+      const dec = bal.decimals;
+      const fmt = (n: number) => (dec === 6 ? n.toFixed(2) : n.toFixed(6));
+      const locked = bal.debits - bal.pendingCredits;
+      const availColor = bal.available > 0.01 ? chalk.green : chalk.red;
+      lines.push(
+        `  ${chalk.bold(sym.padEnd(6))}  ${fmt(bal.deposits).padEnd(18)}${fmt(Math.max(locked, 0)).padEnd(18)}${availColor(fmt(bal.available))}`,
+      );
+      // Tally USD-equivalent for stables only.
+      const isStable = client.poolConfig.tokens.find((t) => t.symbol === sym)?.isStable;
+      if (isStable) totalAvailUsd += bal.available;
+    }
+    lines.push(sep);
+    lines.push(`  ${chalk.dim('Available stable')} ${chalk.bold(formatUsd(totalAvailUsd))}`);
+    lines.push('');
+    return { success: true, message: lines.join('\n'), data: { balances: Object.fromEntries(balances) } };
+  },
+};
+
+/**
  * Drain pendingCredits → deposits on the basket. Run this if `magic verify`
  * shows pendingCredits > 0 — those credits don't count as fully usable until
  * they're settled into the deposit pool.
@@ -732,6 +782,7 @@ export const magicSettle: ToolDefinition = {
 };
 
 export const magicTools: ToolDefinition[] = [
+  magicVault,
   magicSettle,
   magicInspect,
   magicStatus,

@@ -1332,6 +1332,7 @@ export class FlashTerminal {
       console.log(`    ${theme.command('magic remove SOL long 10')}      Remove $10 collateral from SOL long`);
       console.log('');
       console.log(`  ${theme.dim('Vault')}`);
+      console.log(`    ${theme.command('magic vault')}                  How much money is in your vault`);
       console.log(`    ${theme.command('magic deposit USDC 100')}        Deposit 100 USDC into the vault`);
       console.log(`    ${theme.command('magic deposit SOL 0.5')}         Deposit 0.5 SOL into the vault`);
       console.log(`    ${theme.command('magic withdraw USDC 50')}        Withdraw 50 USDC from the vault`);
@@ -2363,6 +2364,9 @@ export class FlashTerminal {
           case 'verify':
           case 'parity':
             return { tool: 'magicVerify', params: {} };
+          case 'vault':
+          case 'balance':
+            return { tool: 'magicVault', params: {} };
           case 'settle': {
             const sym = parts[1];
             return { tool: 'magicSettle', params: sym ? { symbol: sym } : {} };
