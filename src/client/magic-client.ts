@@ -126,6 +126,27 @@ export class MagicTradeClient implements IFlashClient {
   private readonly fastConfirm: boolean;
 
   /**
+   * Most-recent previewOpen quote, cached so openPosition can skip the
+   * duplicate `getOpenPositionQuote` simulate (~100ms saved on the hot path).
+   * Keyed by `${target}:${side}:${collateral}:${leverage}:${collateralToken}`;
+   * cache-hit only when the same key is re-requested within 5s.
+   */
+  private lastQuoteCache: {
+    key: string;
+    quote: {
+      collateralAmount: BN;
+      sizeAmount: BN;
+      entryPrice: { price: BN; exponent: number };
+      liquidationPrice: { price: BN; exponent: number };
+      sizeUsd: BN;
+      collateralUsd: BN;
+      entryFeeUsd: BN;
+      swapRequired: boolean;
+    };
+    ts: number;
+  } | null = null;
+
+  /**
    * Pre-warmed ER blockhash. Refreshed every 400ms in the background so trade
    * ixs can skip the RPC roundtrip (~30-80ms per tx) for `getLatestBlockhash`.
    * The SDK's `sendErTransactionLegacy` calls `conn.getLatestBlockhash()` —
@@ -385,6 +406,23 @@ export class MagicTradeClient implements IFlashClient {
       this.basketPda,
     );
 
+    // Stash the quote so a subsequent openPosition() call with matching params
+    // can reuse it (skips a ~100ms simulate on the hot path).
+    this.lastQuoteCache = {
+      key: this.quoteKey(targetSymbol, side, collateralAmount, leverage, collateralSymbol),
+      quote: {
+        collateralAmount: quote.collateralAmount as BN,
+        sizeAmount: quote.sizeAmount as BN,
+        entryPrice: quote.entryPrice as { price: BN; exponent: number },
+        liquidationPrice: quote.liquidationPrice as { price: BN; exponent: number },
+        sizeUsd: quote.sizeUsd as BN,
+        collateralUsd: quote.collateralUsd as BN,
+        entryFeeUsd: quote.entryFeeUsd as BN,
+        swapRequired: Boolean(quote.swapRequired),
+      },
+      ts: Date.now(),
+    };
+
     return {
       targetSymbol,
       lockSymbol,
@@ -396,6 +434,10 @@ export class MagicTradeClient implements IFlashClient {
       feeUsd: Number((quote.entryFeeUsd as BN).toString()) / USD_POWER,
       swapRequired: Boolean(quote.swapRequired),
     };
+  }
+
+  private quoteKey(target: string, side: TradeSide, coll: number, lev: number, payTok: string): string {
+    return `${target.toUpperCase()}:${side}:${coll}:${lev}:${payTok.toUpperCase()}`;
   }
 
   // ─── IFlashClient: trades ──────────────────────────────────────────────────
@@ -456,25 +498,10 @@ export class MagicTradeClient implements IFlashClient {
         return { txSignature: cached, entryPrice: 0, liquidationPrice: 0, sizeUsd };
       }
 
-      // Auto-settle: closed positions deposit their payout into `pendingCredits`,
-      // not back into `deposits`. The program checks `available = deposits −
-      // debits + pendingCredits` so pendingCredits count technically, but only
-      // when matched 1:1 with debits. We pre-settle the collateral custody
-      // whenever the user holds non-zero pendingCredits — turns close-then-
-      // reopen into a clean flow.
-      const balances = await this.getAvailableBalances();
-      const collBal = balances.get(collateralSymbol);
-      if (collBal && collBal.pendingCredits > 0 && collBal.available < collateralAmount * 1.01) {
-        log.info(
-          'magic-client',
-          `auto-settling ${collateralSymbol}: available=${collBal.available.toFixed(4)} pendingCredits=${collBal.pendingCredits.toFixed(4)} required≈${(collateralAmount * 1.01).toFixed(4)}`,
-        );
-        try {
-          await this.settleCustody(collateralSymbol);
-        } catch (err) {
-          log.warn('magic-client', `settle ${collateralSymbol} failed: ${(err as Error).message} — proceeding anyway`);
-        }
-      }
+      // Auto-settle was here but it added ~200-1500ms to every open and
+      // settle is currently broken on-chain anyway. Skipped on the hot path.
+      // If a trade fails with InsufficientAvailableBalance the user gets a
+      // clear error and can run `magic settle` manually (or just deposit more).
 
       const collateralCustody = this.poolConfig.getCustodyFromSymbol(collateralSymbol);
       const collateralRaw = new BN(Math.floor(collateralAmount * 10 ** collateralCustody.decimals));
@@ -487,20 +514,25 @@ export class MagicTradeClient implements IFlashClient {
       //     its market lookup) and the user's pay token as `receivingSymbol`.
       //   - openPosition takes (target, lock, collateral=user-pay-token).
       //
-      // This is the same shape as the official UI's tx (verified on-chain).
-      const quote = await this.sdk.getOpenPositionQuote(
-        targetSymbol,
-        lockSymbol,         // → SDK uses this for findMarketConfig
-        sdkSide,
-        this.poolConfig,
-        collateralRaw,
-        leverageBps,
-        collateralSymbol,   // → receivingSymbol = user's actual pay token
-        null,
-        null,
-        null,
-        this.basketPda,
-      );
+      // Reuse the previewOpen quote if it's <5s old and matches our params —
+      // saves ~100ms on the hot path after the user's y/n confirm.
+      const quoteCacheKey = this.quoteKey(targetSymbol, side, collateralAmount, leverage, collateralSymbol);
+      const cachedQuote = this.lastQuoteCache;
+      const quote = (cachedQuote && cachedQuote.key === quoteCacheKey && Date.now() - cachedQuote.ts < 5000)
+        ? cachedQuote.quote
+        : (await this.sdk.getOpenPositionQuote(
+            targetSymbol,
+            lockSymbol,
+            sdkSide,
+            this.poolConfig,
+            collateralRaw,
+            leverageBps,
+            collateralSymbol,
+            null,
+            null,
+            null,
+            this.basketPda,
+          )) as unknown as NonNullable<typeof cachedQuote>['quote'];
       const collateralRawForIx = quote.collateralAmount as BN;
       const sizeRawForIx = quote.sizeAmount as BN;
       const entryPriceForReturn = priceToNumber(quote.entryPrice as { price: BN; exponent: number });
@@ -531,11 +563,13 @@ export class MagicTradeClient implements IFlashClient {
         result: 'confirmed',
       });
 
+      // Use the SDK's canonical sizeUsd (fees baked in) so card matches preview.
+      const canonicalSizeUsd = Number((quote.sizeUsd as BN).toString()) / USD_POWER;
       return {
         txSignature: sig,
         entryPrice: entryPriceForReturn,
         liquidationPrice: liqPriceForReturn,
-        sizeUsd,
+        sizeUsd: canonicalSizeUsd,
       };
     } catch (err) {
       guard.logAudit({

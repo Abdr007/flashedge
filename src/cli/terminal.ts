@@ -229,6 +229,13 @@ export class FlashTerminal {
   private lastCommand = '';
   /** Last command execution time in ms (for context line) */
   private lastCommandMs = 0;
+  /**
+   * When set, overrides the command-start timestamp so the displayed latency
+   * measures only the work AFTER an interactive prompt (e.g. magic confirm).
+   * The dispatcher sets this right after the user types y/n, so the ⚡ timer
+   * shows the actual sign+confirm time instead of including the read prompt wait.
+   */
+  private cmdStartOverride: number | null = null;
   /** True when all RPC endpoints are unreachable — blocks trade commands */
   private degradedMode = false;
   /** Tracks whether the degraded-mode entry banner has been shown (prevents spam) */
@@ -814,7 +821,11 @@ export class FlashTerminal {
         this.processingWarnShown = false;
         this.bufferedLine = null;
         this.lastCommand = trimmed;
-        this.lastCommandMs = Date.now() - cmdStart;
+        // Use override if dispatcher reset it after a confirm prompt — that way
+        // the displayed ⚡ time excludes user's read-and-type duration.
+        const effectiveStart = this.cmdStartOverride ?? cmdStart;
+        this.lastCommandMs = Date.now() - effectiveStart;
+        this.cmdStartOverride = null;
         // Record session metrics
         try {
           const { getSessionMetrics } = await import('../core/session-metrics.js');
@@ -1196,8 +1207,8 @@ export class FlashTerminal {
 
     const isMagic = this.config.tradingMode === 'magic';
     const isSim = this.config.tradingMode === 'simulation';
-    const magicNetLabel = (this.config.magicNetwork ?? 'mainnet-beta') === 'mainnet-beta' ? 'MAINNET' : 'DEVNET';
-    const modeLabel = isMagic ? `MAGIC TRADING [${magicNetLabel}]` : isSim ? 'SIMULATION' : 'LIVE TRADING';
+    const isMagicDevnet = (this.config.magicNetwork ?? 'mainnet-beta') !== 'mainnet-beta';
+    const modeLabel = isMagic ? (isMagicDevnet ? 'MAGIC TRADING [DEVNET]' : 'MAGIC TRADING (v2)') : isSim ? 'SIMULATION' : 'LIVE TRADING (v1)';
     const modeBg = isMagic ? chalk.bgMagenta.white.bold : isSim ? theme.simBadge : theme.liveBadge;
 
     // Header
@@ -1216,7 +1227,7 @@ export class FlashTerminal {
       console.log(theme.pair('Program', theme.value('FMTgsEDaPPfJi1PKD67McLTC5n833T4irbBP53LLxtvj')));
       console.log(theme.pair('Router', theme.value(this.config.magicRpcUrl)));
       console.log('');
-      console.log(theme.dim('  Run `magic status` to see preflight state, `magic setup` to initialise.'));
+      console.log(theme.dim('  Run `magic status` to check preflight state, `magic verify` for CLI/UI parity.'));
     } else if (isSim) {
       console.log(theme.pair('Balance', theme.positive('$' + this.flashClient.getBalance().toFixed(2))));
       console.log(theme.dim('  Trades are simulated. No real transactions.'));
@@ -2498,6 +2509,9 @@ export class FlashTerminal {
             return;
           }
         }
+        // Reset latency clock — the ⚡ timer should show the sign+confirm time only,
+        // not the seconds the user spent reading the preview and typing y.
+        this.cmdStartOverride = Date.now();
       }
 
       try {
@@ -3490,7 +3504,7 @@ export class FlashTerminal {
       const leverage = Number(params.leverage);
       const collateralToken = params.collateralToken ? String(params.collateralToken).toUpperCase() : 'USDC';
       const q = await client.previewOpen(market, side as TradeSide, collateral, leverage, collateralToken);
-      const liqStr = q.liquidationPrice > 0 ? chalk.yellow(`$${q.liquidationPrice.toFixed(4)}`) : chalk.dim('N/A');
+      const liqStr = q.liquidationPrice > 0 ? chalk.yellow(formatPrice(q.liquidationPrice)) : chalk.dim('N/A');
       const swapStr = q.swapRequired ? chalk.cyan(`(swap ${q.collateralSymbol}→${q.lockSymbol})`) : chalk.dim(`(direct, lock=${q.lockSymbol})`);
       return [
         '',
