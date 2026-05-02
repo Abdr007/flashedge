@@ -735,6 +735,169 @@ export class MagicTradeClient implements IFlashClient {
     }
   }
 
+  // ─── Extended trade ops (reverse, partial close, increase, triggers) ────
+
+  /**
+   * Reverse a position — close current side, open opposite side with the
+   * same collateral. Two ER txs back-to-back. Returns both signatures.
+   * Named `flipPosition` (not `reversePosition`) to avoid clashing with the
+   * optional IFlashClient.reversePosition that has a different signature.
+   */
+  async flipPosition(
+    market: string,
+    currentSide: TradeSide,
+    collateralAmount: number,
+    leverage: number,
+  ): Promise<{ closeSig: string; openSig: string; newSide: TradeSide }> {
+    const closeResult = await this.closePosition(market, currentSide);
+    const newSide = currentSide === TradeSide.Long ? TradeSide.Short : TradeSide.Long;
+    const openResult = await this.openPosition(market, newSide, collateralAmount, leverage);
+    return { closeSig: closeResult.txSignature, openSig: openResult.txSignature, newSide };
+  }
+
+  /**
+   * Partial close — reduce position size by `closeUsd` USD (or by percent of
+   * current size). Uses SDK's decreasePositionSize. Position remains open
+   * with the residual size.
+   */
+  async decreasePosition(
+    market: string,
+    side: TradeSide,
+    closeUsd: number,
+    receiveToken = 'USDC',
+  ): Promise<{ txSignature: string }> {
+    const targetSymbol = market.toUpperCase();
+    const sdkSide = side === TradeSide.Long ? Side.Long : Side.Short;
+    const { lockSymbol } = this.resolveMarket(targetSymbol, side);
+    const targetCustody = this.poolConfig.getCustodyFromSymbol(targetSymbol);
+
+    // Convert USD delta to target-token raw via current oracle price.
+    const oraclePrice = await this.fetchOraclePrice(targetSymbol, lockSymbol, side);
+    if (!Number.isFinite(oraclePrice) || oraclePrice <= 0) {
+      throw new Error(`[magic-mode] could not fetch ${targetSymbol} oracle for partial close`);
+    }
+    const sizeDeltaRaw = new BN(Math.floor((closeUsd / oraclePrice) * 10 ** targetCustody.decimals));
+
+    const guard = getSigningGuard();
+    const rate = guard.checkRateLimit();
+    if (!rate.allowed) throw new Error(rate.reason);
+
+    const lockKey = `${targetSymbol}:${side}`;
+    this.acquireTradeLock(lockKey);
+    try {
+      const result = await this.sdk.decreasePositionSize(
+        targetSymbol,
+        lockSymbol,
+        sdkSide,
+        this.poolConfig,
+        sizeDeltaRaw,
+        receiveToken.toUpperCase(),
+      );
+      const sig = await this.sendErIxs(result.instructions, result.additionalSigners, 'magic.decrease');
+      guard.recordSigning();
+      guard.logAudit({
+        timestamp: new Date().toISOString(),
+        type: 'partial_close',
+        market: targetSymbol,
+        side,
+        sizeUsd: closeUsd,
+        walletAddress: this.walletAddress,
+        result: 'confirmed',
+      });
+      return { txSignature: sig };
+    } finally {
+      this.releaseTradeLock(lockKey);
+    }
+  }
+
+  /**
+   * Increase position size — adds `addUsd` of additional size at current
+   * oracle price, optionally adding more collateral via `addCollateralUsd`.
+   * Uses SDK's increasePositionSize.
+   */
+  async increasePosition(
+    market: string,
+    side: TradeSide,
+    addUsd: number,
+    addCollateralUsd = 0,
+    collateralToken = 'USDC',
+  ): Promise<{ txSignature: string }> {
+    const targetSymbol = market.toUpperCase();
+    const sdkSide = side === TradeSide.Long ? Side.Long : Side.Short;
+    const { lockSymbol } = this.resolveMarket(targetSymbol, side);
+    const targetCustody = this.poolConfig.getCustodyFromSymbol(targetSymbol);
+    const colCustody = this.poolConfig.getCustodyFromSymbol(collateralToken.toUpperCase());
+
+    const oraclePrice = await this.fetchOraclePrice(targetSymbol, lockSymbol, side);
+    if (!Number.isFinite(oraclePrice) || oraclePrice <= 0) {
+      throw new Error(`[magic-mode] could not fetch ${targetSymbol} oracle for increase`);
+    }
+    const sizeDeltaRaw = new BN(Math.floor((addUsd / oraclePrice) * 10 ** targetCustody.decimals));
+    const colRaw = new BN(Math.floor(addCollateralUsd * 10 ** colCustody.decimals));
+
+    const guard = getSigningGuard();
+    const rate = guard.checkRateLimit();
+    if (!rate.allowed) throw new Error(rate.reason);
+
+    const lockKey = `${targetSymbol}:${side}`;
+    this.acquireTradeLock(lockKey);
+    try {
+      const result = await this.sdk.increasePositionSize(
+        targetSymbol,
+        lockSymbol,
+        sdkSide,
+        this.poolConfig,
+        sizeDeltaRaw,
+        colRaw,
+      );
+      const sig = await this.sendErIxs(result.instructions, result.additionalSigners, 'magic.increase');
+      guard.recordSigning();
+      return { txSignature: sig };
+    } finally {
+      this.releaseTradeLock(lockKey);
+    }
+  }
+
+  /**
+   * Place a TP or SL trigger order on an open position.
+   * triggerPrice = USD level. isStopLoss = true for SL, false for TP.
+   * deltaSizeUsd = how much of the position to close at trigger (default = full).
+   */
+  async placeTrigger(
+    market: string,
+    side: TradeSide,
+    triggerPriceUsd: number,
+    isStopLoss: boolean,
+    deltaSizeUsd?: number,
+  ): Promise<{ txSignature: string }> {
+    const targetSymbol = market.toUpperCase();
+    const sdkSide = side === TradeSide.Long ? Side.Long : Side.Short;
+    const { lockSymbol } = this.resolveMarket(targetSymbol, side);
+    const targetCustody = this.poolConfig.getCustodyFromSymbol(targetSymbol);
+
+    const oraclePrice = await this.fetchOraclePrice(targetSymbol, lockSymbol, side);
+    const fullSize = (await this.getPortfolio()).positions.find(
+      (p) => p.market.toUpperCase() === targetSymbol && p.side === side,
+    )?.sizeUsd;
+    const closeUsd = deltaSizeUsd ?? fullSize ?? 0;
+    if (closeUsd <= 0) throw new Error('[magic-mode] no open position to attach trigger to (or zero size)');
+    const deltaSizeRaw = new BN(Math.floor((closeUsd / oraclePrice) * 10 ** targetCustody.decimals));
+
+    const result = await this.sdk.placeTriggerOrder(
+      targetSymbol,
+      lockSymbol,
+      sdkSide,
+      this.poolConfig,
+      {
+        triggerPrice: usdToOraclePrice(triggerPriceUsd),
+        deltaSizeAmount: deltaSizeRaw,
+        isStopLoss,
+      } as unknown as Parameters<typeof this.sdk.placeTriggerOrder>[4],
+    );
+    const sig = await this.sendErIxs(result.instructions, result.additionalSigners, isStopLoss ? 'magic.sl' : 'magic.tp');
+    return { txSignature: sig };
+  }
+
   // ─── L1 setup (basket / UDL / delegate / deposit) ─────────────────────────
 
   async initializeUserDepositLedger(): Promise<string | 'already_initialised'> {
@@ -1328,4 +1491,13 @@ export class MagicTradeClient implements IFlashClient {
 function priceToNumber(p: { price: BN; exponent: number } | undefined): number {
   if (!p) return 0;
   return Number(p.price) * Math.pow(10, p.exponent);
+}
+
+/**
+ * Convert a USD price (e.g. 84.50) into the on-chain `OraclePrice` shape.
+ * Default exponent matches Pyth's typical -8 for crypto USD feeds.
+ */
+function usdToOraclePrice(usd: number, exponent = -8): { price: BN; exponent: number } {
+  const scaled = Math.round(usd * Math.pow(10, -exponent));
+  return { price: new BN(scaled), exponent };
 }

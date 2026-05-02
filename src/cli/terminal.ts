@@ -1325,11 +1325,16 @@ export class FlashTerminal {
     if (isMagic) {
       console.log('');
       console.log(`  ${theme.dim('Trading')}`);
-      console.log(`    ${theme.command('magic open SOL long 10 2')}      Open SOL long, $10 collateral, 2x leverage`);
-      console.log(`    ${theme.command('magic open BTC short 50 5')}     Open BTC short, $50 collateral, 5x leverage`);
-      console.log(`    ${theme.command('magic close SOL long')}          Close SOL long, payout in USDC`);
-      console.log(`    ${theme.command('magic add SOL long 25')}         Add $25 collateral to SOL long`);
-      console.log(`    ${theme.command('magic remove SOL long 10')}      Remove $10 collateral from SOL long`);
+      console.log(`    ${theme.command('open SOL long 10 2')}            Open SOL long, $10 collateral, 2x leverage`);
+      console.log(`    ${theme.command('open BTC short 50 5')}           Open BTC short, $50 collateral, 5x leverage`);
+      console.log(`    ${theme.command('close SOL long')}                Close SOL long, payout in USDC`);
+      console.log(`    ${theme.command('partial-close SOL long 5')}      Close $5 of size, keep the rest`);
+      console.log(`    ${theme.command('reverse SOL long 10 2')}         Flip long → short with same collateral`);
+      console.log(`    ${theme.command('increase SOL long 10')}          Add $10 of size at current price`);
+      console.log(`    ${theme.command('add SOL long 25')}               Add $25 collateral to SOL long`);
+      console.log(`    ${theme.command('remove SOL long 10')}            Remove $10 collateral from SOL long`);
+      console.log(`    ${theme.command('tp SOL long 95')}                Set Take-Profit at $95`);
+      console.log(`    ${theme.command('sl SOL long 80')}                Set Stop-Loss at $80`);
       console.log('');
       console.log(`  ${theme.dim('Vault')}`);
       console.log(`    ${theme.command('magic vault')}                  How much money is in your vault`);
@@ -2347,6 +2352,8 @@ export class FlashTerminal {
     // magic command from another mode (which is gated below anyway).
     const MAGIC_VERBS = new Set([
       'open', 'close', 'add', 'add-collateral', 'remove', 'remove-collateral',
+      'reverse', 'flip', 'increase', 'inc', 'partial-close', 'decrease', 'dec',
+      'tp', 'sl', 'take-profit', 'stop-loss',
       'deposit', 'withdraw', 'settle',
       'vault', 'balance', 'portfolio', 'verify', 'parity',
       'price', 'markets', 'status', 'inspect', 'delegation', 'delegated',
@@ -2477,6 +2484,57 @@ export class FlashTerminal {
             }
             return { error: 'usage: magic add <symbol> <long|short> <amount_usd>  (e.g. `magic add SOL long $25`)' };
           }
+          case 'partial-close':
+          case 'decrease':
+          case 'dec': {
+            // magic partial-close <symbol> <side> <size_usd>
+            if (parts.length < 4) return { error: 'usage: magic partial-close <symbol> <long|short> <size_usd>' };
+            const side = parts[2];
+            if (side !== 'long' && side !== 'short') return { error: `side must be 'long' or 'short'` };
+            const sizeUsd = Number(String(parts[3]).replace(/[$,]/g, ''));
+            if (!Number.isFinite(sizeUsd) || sizeUsd <= 0) return { error: `size must be a positive number (got '${parts[3]}')` };
+            return { tool: 'magicPartialClose', params: { market: parts[1], side, sizeUsd } };
+          }
+          case 'reverse':
+          case 'flip': {
+            // magic reverse <symbol> <currentSide> <collateral> <leverage>
+            const argString = parts.slice(1).join(' ');
+            const parsed = localParse(`open ${argString}`);
+            if (parsed && parsed.action === ActionType.OpenPosition) {
+              const p = parsed as { market: string; side: TradeSide; collateral: number; leverage: number };
+              return { tool: 'magicReverse', params: {
+                market: String(p.market), side: String(p.side),
+                collateral: Number(p.collateral), leverage: Number(p.leverage),
+              } };
+            }
+            return { error: 'usage: magic reverse <symbol> <currentSide> <collateral> <leverage>' };
+          }
+          case 'increase':
+          case 'inc': {
+            // magic increase <symbol> <side> <sizeUsd> [addCollateral]
+            if (parts.length < 4) return { error: 'usage: magic increase <symbol> <long|short> <size_usd> [add_collateral_usd]' };
+            const side = parts[2];
+            if (side !== 'long' && side !== 'short') return { error: `side must be 'long' or 'short' (got '${side}')` };
+            const sizeUsd = Number(String(parts[3]).replace(/[$,]/g, ''));
+            const addColl = parts[4] ? Number(String(parts[4]).replace(/[$,]/g, '')) : 0;
+            if (!Number.isFinite(sizeUsd) || sizeUsd <= 0) return { error: `size must be a positive number (got '${parts[3]}')` };
+            return { tool: 'magicIncrease', params: { market: parts[1], side, sizeUsd, addCollateralUsd: addColl } };
+          }
+          case 'tp':
+          case 'sl':
+          case 'take-profit':
+          case 'stop-loss': {
+            // magic tp <symbol> <side> <price> [size]
+            // magic sl <symbol> <side> <price> [size]
+            if (parts.length < 4) return { error: `usage: magic ${parts[0]} <symbol> <long|short> <price> [size_usd]` };
+            const side = parts[2];
+            if (side !== 'long' && side !== 'short') return { error: `side must be 'long' or 'short'` };
+            const price = Number(String(parts[3]).replace(/[$,]/g, ''));
+            const sizeUsd = parts[4] ? Number(String(parts[4]).replace(/[$,]/g, '')) : undefined;
+            if (!Number.isFinite(price) || price <= 0) return { error: `price must be a positive number (got '${parts[3]}')` };
+            const isStopLoss = parts[0] === 'sl' || parts[0] === 'stop-loss';
+            return { tool: 'magicTriggerOrder', params: { market: parts[1], side, price, isStopLoss, ...(sizeUsd ? { sizeUsd } : {}) } };
+          }
           case 'remove':
           case 'remove-collateral': {
             const argString = parts.slice(1).join(' ');
@@ -2532,7 +2590,11 @@ export class FlashTerminal {
       // ─── Preview + Y/N confirm before signing ────────────────────────
       // Set MAGIC_AUTO_CONFIRM=true to skip (for power users / scripted flow).
       const autoConfirm = (process.env.MAGIC_AUTO_CONFIRM ?? 'false').toLowerCase() === 'true';
-      const needsConfirm = !autoConfirm && ['magicOpen', 'magicClose', 'magicAddCollateral', 'magicRemoveCollateral', 'magicWithdraw'].includes(resolved.tool!);
+      const needsConfirm = !autoConfirm && [
+        'magicOpen', 'magicClose', 'magicAddCollateral', 'magicRemoveCollateral',
+        'magicReverse', 'magicPartialClose', 'magicIncrease', 'magicTriggerOrder',
+        'magicWithdraw',
+      ].includes(resolved.tool!);
       if (needsConfirm) {
         try {
           const previewMsg = await this.buildMagicPreview(resolved.tool!, resolved.params!);

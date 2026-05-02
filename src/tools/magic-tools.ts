@@ -775,6 +775,137 @@ export const magicVault: ToolDefinition = {
   },
 };
 
+export const magicReverse: ToolDefinition = {
+  name: 'magicReverse',
+  description: 'Close current position and open opposite side with same collateral. args: market, side, collateral, leverage.',
+  parameters: z.object({
+    market: z.string(),
+    side: z.enum(['long', 'short']),
+    collateral: z.number().positive(),
+    leverage: z.number().positive(),
+  }),
+  async execute(params, context): Promise<ToolResult> {
+    const client = buildMagicClient(context);
+    const result = await client.flipPosition(
+      params.market as string,
+      params.side as TradeSide,
+      params.collateral as number,
+      params.leverage as number,
+    );
+    return {
+      success: true,
+      message: [
+        '',
+        chalk.green('  Position Reversed'),
+        chalk.dim('  ─────────────────'),
+        `  Market:           ${chalk.cyan(String(params.market).toUpperCase())} ${chalk.dim('→')} ${chalk.bold(result.newSide)}`,
+        `  Close TX:         ${chalk.dim(shortSig(result.closeSig))}  ${chalk.dim(solscanTx(result.closeSig, client.network))}`,
+        `  Open  TX:         ${chalk.dim(shortSig(result.openSig))}  ${chalk.dim(solscanTx(result.openSig, client.network))}`,
+        '',
+      ].join('\n'),
+      txSignature: result.openSig,
+    };
+  },
+};
+
+export const magicPartialClose: ToolDefinition = {
+  name: 'magicPartialClose',
+  description: 'Close part of a position by USD amount. args: market, side, sizeUsd.',
+  parameters: z.object({
+    market: z.string(),
+    side: z.enum(['long', 'short']),
+    sizeUsd: z.number().positive(),
+  }),
+  async execute(params, context): Promise<ToolResult> {
+    const client = buildMagicClient(context);
+    const r = await client.decreasePosition(params.market as string, params.side as TradeSide, params.sizeUsd as number);
+    return {
+      success: true,
+      message: [
+        '',
+        chalk.green('  Position Partial Close'),
+        chalk.dim('  ─────────────────'),
+        `  Market:           ${chalk.cyan(String(params.market).toUpperCase())} ${chalk.bold(String(params.side))}`,
+        `  Closed:           ${formatUsd(params.sizeUsd as number)}`,
+        `  TX: ${chalk.dim(shortSig(r.txSignature))}  ${chalk.dim(solscanTx(r.txSignature, client.network))}`,
+        '',
+      ].join('\n'),
+      txSignature: r.txSignature,
+    };
+  },
+};
+
+export const magicIncrease: ToolDefinition = {
+  name: 'magicIncrease',
+  description: 'Add to position size. args: market, side, sizeUsd, addCollateralUsd?.',
+  parameters: z.object({
+    market: z.string(),
+    side: z.enum(['long', 'short']),
+    sizeUsd: z.number().positive(),
+    addCollateralUsd: z.number().nonnegative().optional(),
+  }),
+  async execute(params, context): Promise<ToolResult> {
+    const client = buildMagicClient(context);
+    const r = await client.increasePosition(
+      params.market as string,
+      params.side as TradeSide,
+      params.sizeUsd as number,
+      (params.addCollateralUsd as number | undefined) ?? 0,
+    );
+    return {
+      success: true,
+      message: [
+        '',
+        chalk.green('  Position Increased'),
+        chalk.dim('  ─────────────────'),
+        `  Market:           ${chalk.cyan(String(params.market).toUpperCase())} ${chalk.bold(String(params.side))}`,
+        `  Added size:       ${formatUsd(params.sizeUsd as number)}`,
+        ...(params.addCollateralUsd ? [`  Added collateral: ${formatUsd(params.addCollateralUsd as number)}`] : []),
+        `  TX: ${chalk.dim(shortSig(r.txSignature))}  ${chalk.dim(solscanTx(r.txSignature, client.network))}`,
+        '',
+      ].join('\n'),
+      txSignature: r.txSignature,
+    };
+  },
+};
+
+export const magicTriggerOrder: ToolDefinition = {
+  name: 'magicTriggerOrder',
+  description: 'Place TP or SL on a position. args: market, side, price, isStopLoss, sizeUsd?',
+  parameters: z.object({
+    market: z.string(),
+    side: z.enum(['long', 'short']),
+    price: z.number().positive(),
+    isStopLoss: z.boolean(),
+    sizeUsd: z.number().positive().optional(),
+  }),
+  async execute(params, context): Promise<ToolResult> {
+    const client = buildMagicClient(context);
+    const r = await client.placeTrigger(
+      params.market as string,
+      params.side as TradeSide,
+      params.price as number,
+      params.isStopLoss as boolean,
+      params.sizeUsd as number | undefined,
+    );
+    const label = params.isStopLoss ? 'Stop Loss' : 'Take Profit';
+    return {
+      success: true,
+      message: [
+        '',
+        chalk.green(`  ${label} Set`),
+        chalk.dim('  ─────────────────'),
+        `  Market:           ${chalk.cyan(String(params.market).toUpperCase())} ${chalk.bold(String(params.side))}`,
+        `  Trigger:          ${formatPrice(params.price as number)}`,
+        ...(params.sizeUsd ? [`  Size at trigger:  ${formatUsd(params.sizeUsd as number)}`] : ['  Size at trigger:  full position']),
+        `  TX: ${chalk.dim(shortSig(r.txSignature))}  ${chalk.dim(solscanTx(r.txSignature, client.network))}`,
+        '',
+      ].join('\n'),
+      txSignature: r.txSignature,
+    };
+  },
+};
+
 /**
  * Drain pendingCredits → deposits on the basket. Run this if `magic verify`
  * shows pendingCredits > 0 — those credits don't count as fully usable until
@@ -832,5 +963,9 @@ export const magicTools: ToolDefinition[] = [
   magicClose,
   magicAddCollateral,
   magicRemoveCollateral,
+  magicReverse,
+  magicPartialClose,
+  magicIncrease,
+  magicTriggerOrder,
   magicFaucet,
 ];
