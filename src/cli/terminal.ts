@@ -989,9 +989,9 @@ export class FlashTerminal {
     console.log(theme.dim('       Test strategies using paper trading.'));
     console.log('');
     {
-      const magicNet = (process.env.MAGIC_NETWORK ?? 'mainnet-beta').toLowerCase() === 'devnet' ? 'DEVNET' : 'MAINNET';
-      const magicTag = magicNet === 'MAINNET' ? chalk.green(`[${magicNet}]`) : chalk.red(`[${magicNet}]`);
-      console.log(`    ${theme.command('3)')} ${theme.section('MAGIC TRADING')} ${chalk.dim('(v2)')} ${magicTag}`);
+      const isDevnet = (process.env.MAGIC_NETWORK ?? 'mainnet-beta').toLowerCase() === 'devnet';
+      const tail = isDevnet ? `  ${chalk.red('[DEVNET]')}` : '';
+      console.log(`    ${theme.command('3)')} ${theme.section('MAGIC TRADING')} ${chalk.dim('(v2)')}${tail}`);
     }
     console.log(theme.dim('       Flash Magic Trade on MagicBlock ER — sub-second confirms.'));
     console.log('');
@@ -1311,11 +1311,44 @@ export class FlashTerminal {
 
     // ─── Quick Start Hints ───────────────────────────────────────
     console.log(theme.section('  Quick Start'));
-    console.log(`    ${theme.command('help')}           List all commands`);
-    console.log(`    ${theme.command('dashboard')}      Protocol & portfolio overview`);
-    console.log(`    ${theme.command('monitor')}        Live market monitoring`);
-    console.log(`    ${theme.command('wallet tokens')}  View token balances`);
-    console.log(`    ${theme.command('markets')}        View available markets`);
+    if (isMagic) {
+      // Magic mode — show every magic command grouped by category.
+      console.log('');
+      console.log(`  ${theme.dim('Trading')}`);
+      console.log(`    ${theme.command('magic open <sym> <long|short> <coll> <lev>')}    Open position (e.g. ${theme.dim('magic open SOL short 5 2')})`);
+      console.log(`    ${theme.command('magic close <sym> <long|short> [recv]')}        Close position`);
+      console.log(`    ${theme.command('magic add <sym> <long|short> <usd>')}            Add collateral`);
+      console.log(`    ${theme.command('magic remove <sym> <long|short> <usd>')}         Remove collateral`);
+      console.log('');
+      console.log(`  ${theme.dim('Vault')}`);
+      console.log(`    ${theme.command('magic deposit <symbol|mint> <amount>')}          Deposit to vault`);
+      console.log(`    ${theme.command('magic withdraw <symbol|mint> <amount>')}         Withdraw from vault`);
+      console.log(`    ${theme.command('magic settle [symbol]')}                         Drain pending credits/debits`);
+      console.log('');
+      console.log(`  ${theme.dim('Inspect')}`);
+      console.log(`    ${theme.command('magic portfolio')}             Live PnL / mark / liq per position`);
+      console.log(`    ${theme.command('magic verify')}                CLI ↔ UI parity check`);
+      console.log(`    ${theme.command('magic price <symbol>')}        Current oracle price`);
+      console.log(`    ${theme.command('magic markets')}               All 52 markets + leverage caps`);
+      console.log(`    ${theme.command('magic status')}                Wallet preflight (SOL, UDL, basket)`);
+      console.log(`    ${theme.command('magic inspect')}               Network + pool + program + custodies`);
+      console.log(`    ${theme.command('magic delegation')}            Basket delegation status`);
+      console.log('');
+      console.log(`  ${theme.dim('Setup')}`);
+      console.log(`    ${theme.command('magic setup')}                 One-time: init UDL + basket + delegate`);
+      console.log(`    ${theme.command('magic faucet')}                Devnet SOL + test stable links`);
+      console.log('');
+      console.log(`  ${theme.dim('General')}`);
+      console.log(`    ${theme.command('help')}                        Full command list (all categories)`);
+      console.log(`    ${theme.command('wallet tokens')}               Wallet token balances`);
+      console.log(`    ${theme.command('exit')}                        Close terminal`);
+    } else {
+      console.log(`    ${theme.command('help')}           List all commands`);
+      console.log(`    ${theme.command('dashboard')}      Protocol & portfolio overview`);
+      console.log(`    ${theme.command('monitor')}        Live market monitoring`);
+      console.log(`    ${theme.command('wallet tokens')}  View token balances`);
+      console.log(`    ${theme.command('markets')}        View available markets`);
+    }
     console.log('');
     console.log(theme.dim('  Type "exit" to close the terminal.'));
     console.log('');
