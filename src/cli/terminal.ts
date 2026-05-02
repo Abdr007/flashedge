@@ -988,7 +988,11 @@ export class FlashTerminal {
     console.log(`    ${theme.command('2)')} ${theme.section('SIMULATION')}`);
     console.log(theme.dim('       Test strategies using paper trading.'));
     console.log('');
-    console.log(`    ${theme.command('3)')} ${theme.section('MAGIC TRADING')} ${chalk.red('[DEVNET]')}`);
+    {
+      const magicNet = (process.env.MAGIC_NETWORK ?? 'mainnet-beta').toLowerCase() === 'devnet' ? 'DEVNET' : 'MAINNET';
+      const magicTag = magicNet === 'MAINNET' ? chalk.green(`[${magicNet}]`) : chalk.red(`[${magicNet}]`);
+      console.log(`    ${theme.command('3)')} ${theme.section('MAGIC TRADING')} ${magicTag}`);
+    }
     console.log(theme.dim('       Flash Magic Trade on MagicBlock ER — session-key UX, sub-50ms.'));
     console.log('');
     console.log(`    ${theme.command('4)')} ${theme.dim('Exit')}`);
@@ -1192,7 +1196,8 @@ export class FlashTerminal {
 
     const isMagic = this.config.tradingMode === 'magic';
     const isSim = this.config.tradingMode === 'simulation';
-    const modeLabel = isMagic ? 'MAGIC TRADING [DEVNET]' : isSim ? 'SIMULATION' : 'LIVE TRADING';
+    const magicNetLabel = (this.config.magicNetwork ?? 'mainnet-beta') === 'mainnet-beta' ? 'MAINNET' : 'DEVNET';
+    const modeLabel = isMagic ? `MAGIC TRADING [${magicNetLabel}]` : isSim ? 'SIMULATION' : 'LIVE TRADING';
     const modeBg = isMagic ? chalk.bgMagenta.white.bold : isSim ? theme.simBadge : theme.liveBadge;
 
     // Header

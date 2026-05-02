@@ -458,9 +458,10 @@ export const magicSessionStart: ToolDefinition = {
     const tx = new Transaction();
     for (const ix of built.instructions) tx.add(ix);
     const extraSigners = built.additionalSigners.filter((s): s is Keypair => 'secretKey' in s);
+    // Public mainnet RPCs reject preflight; skip it on mainnet (mirrors magic-client.sendL1Ixs).
     const sig = await sendAndConfirmTransaction(l1Connection, tx, [kp, built.sessionKeypair, ...extraSigners], {
       commitment: 'confirmed',
-      skipPreflight: false,
+      skipPreflight: client.network === 'mainnet-beta',
     });
 
     // Activate + persist.

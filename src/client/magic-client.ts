@@ -405,25 +405,21 @@ export class MagicTradeClient implements IFlashClient {
       }
 
       const collateralCustody = this.poolConfig.getCustodyFromSymbol(collateralSymbol);
+      const targetCustody = this.poolConfig.getCustodyFromSymbol(targetSymbol);
       const collateralRaw = new BN(Math.floor(collateralAmount * 10 ** collateralCustody.decimals));
 
-      // Quote the position size from the SDK — converts USD collateral × leverage
-      // into the target token's native u64 size at current oracle price.
-      const quote = await this.sdk.getOpenPositionQuote(
-        targetSymbol,
-        collateralSymbol,
-        sdkSide,
-        this.poolConfig,
-        collateralRaw,
-        new BN(Math.round(leverage * BPS_POWER)),
-        undefined,
-        null,
-        null,
-        null,
-        this.basketPda,
-      );
-
-      const sizeRaw = quote.sizeAmount as BN;
+      // Compute size locally from on-chain oracle. We avoid getOpenPositionQuote
+      // because its internal market lookup uses collateralSymbol as lockSymbol —
+      // breaks for SOL Long (lock=SOL) when paying with USDC. Local math:
+      //   sizeUsd     = collateralUsd × leverage
+      //   sizeAmount  = sizeUsd / oraclePrice × 10^targetDecimals
+      const oraclePrice = await this.fetchOraclePrice(targetSymbol);
+      if (!Number.isFinite(oraclePrice) || oraclePrice <= 0) {
+        throw new Error(
+          `[magic-mode] could not fetch oracle price for ${targetSymbol} — refusing to open position with unknown size`,
+        );
+      }
+      const sizeRaw = new BN(Math.floor((sizeUsd / oraclePrice) * 10 ** targetCustody.decimals));
 
       const result = await this.sdk.openPosition(
         targetSymbol,
@@ -452,8 +448,8 @@ export class MagicTradeClient implements IFlashClient {
 
       return {
         txSignature: sig,
-        entryPrice: priceToNumber(quote.entryPrice as { price: BN; exponent: number }),
-        liquidationPrice: priceToNumber(quote.liquidationPrice as { price: BN; exponent: number }),
+        entryPrice: oraclePrice,
+        liquidationPrice: 0, // computed live by `magic portfolio` via getLiquidationPrice
         sizeUsd,
       };
     } catch (err) {
@@ -483,7 +479,9 @@ export class MagicTradeClient implements IFlashClient {
   ): Promise<ClosePositionResult> {
     const targetSymbol = market.toUpperCase();
     const sdkSide = side === 'long' ? Side.Long : Side.Short;
-    const collateralSymbol = receiveToken?.toUpperCase() ?? 'USDC';
+    const { lockSymbol } = this.resolveMarket(targetSymbol, side);
+    // User defaults to USDC payout; can override with receiveToken.
+    const receivingSymbol = receiveToken?.toUpperCase() ?? 'USDC';
 
     const guard = getSigningGuard();
     const rate = guard.checkRateLimit();
@@ -499,12 +497,15 @@ export class MagicTradeClient implements IFlashClient {
         return { txSignature: cached, exitPrice: 0, pnl: 0 };
       }
 
+      // SDK arg order: (target, lockSymbol, side, pool, receivingSymbol). The
+      // 2nd arg is used by `findMarketConfig(target, lockSymbol, side)` — must
+      // be the market's lock custody, NOT the user's payout token.
       const result = await this.sdk.closePosition(
         targetSymbol,
-        collateralSymbol,
+        lockSymbol,
         sdkSide,
         this.poolConfig,
-        receiveToken?.toUpperCase(),
+        receivingSymbol,
       );
 
       const sig = await this.sendErIxs(result.instructions, result.additionalSigners, 'magic.closePosition');
@@ -528,9 +529,10 @@ export class MagicTradeClient implements IFlashClient {
   async addCollateral(market: string, side: TradeSide, amount: number): Promise<CollateralResult> {
     const targetSymbol = market.toUpperCase();
     const sdkSide = side === 'long' ? Side.Long : Side.Short;
-    const collateralSymbol = 'USDC';
-    const custody = this.poolConfig.getCustodyFromSymbol(collateralSymbol);
-    const amountRaw = new BN(Math.floor(amount * 10 ** custody.decimals));
+    const { lockSymbol } = this.resolveMarket(targetSymbol, side);
+    const depositingSymbol = 'USDC'; // user adds collateral in USDC; SDK swaps to lock if needed
+    const depositCustody = this.poolConfig.getCustodyFromSymbol(depositingSymbol);
+    const amountRaw = new BN(Math.floor(amount * 10 ** depositCustody.decimals));
 
     const guard = getSigningGuard();
     const rate = guard.checkRateLimit();
@@ -545,10 +547,11 @@ export class MagicTradeClient implements IFlashClient {
 
       const result = await this.sdk.addCollateral(
         targetSymbol,
-        collateralSymbol,
+        lockSymbol,
         sdkSide,
         this.poolConfig,
         amountRaw,
+        depositingSymbol,
       );
       const sig = await this.sendErIxs(result.instructions, result.additionalSigners, 'magic.addCollateral');
       this.recordRecentTrade(cacheKey, sig);
@@ -571,7 +574,8 @@ export class MagicTradeClient implements IFlashClient {
   async removeCollateral(market: string, side: TradeSide, amount: number): Promise<CollateralResult> {
     const targetSymbol = market.toUpperCase();
     const sdkSide = side === 'long' ? Side.Long : Side.Short;
-    const collateralSymbol = 'USDC';
+    const { lockSymbol } = this.resolveMarket(targetSymbol, side);
+    const dispensingSymbol = 'USDC'; // payout in USDC by default
     // remove takes USD-denominated delta (6dp).
     const amountUsd = new BN(Math.floor(amount * USD_POWER));
 
@@ -588,10 +592,11 @@ export class MagicTradeClient implements IFlashClient {
 
       const result = await this.sdk.removeCollateral(
         targetSymbol,
-        collateralSymbol,
+        lockSymbol,
         sdkSide,
         this.poolConfig,
         amountUsd,
+        dispensingSymbol,
       );
       const sig = await this.sendErIxs(result.instructions, result.additionalSigners, 'magic.removeCollateral');
       this.recordRecentTrade(cacheKey, sig);
@@ -883,9 +888,11 @@ export class MagicTradeClient implements IFlashClient {
     const tx = new Transaction();
     for (const ix of ixs) tx.add(ix);
     const signers: Signer[] = [this.wallet, ...additionalSigners];
+    // Public mainnet RPCs reject `simulateTransaction` ("preflight check is not supported"),
+    // so skip preflight on mainnet. Devnet RPCs allow it; keep it on for cheaper feedback.
     return sendAndConfirmTransaction(this.l1Connection, tx, signers, {
       commitment: 'confirmed',
-      skipPreflight: false,
+      skipPreflight: this.network === 'mainnet-beta',
     });
   }
 
@@ -1126,6 +1133,3 @@ function priceToNumber(p: { price: BN; exponent: number } | undefined): number {
   if (!p) return 0;
   return Number(p.price) * Math.pow(10, p.exponent);
 }
-
-/** BPS → BN power-of-ten helper for getOpenPositionQuote leverage arg. */
-const BPS_POWER = 10_000;
