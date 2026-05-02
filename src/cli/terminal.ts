@@ -2352,13 +2352,18 @@ export class FlashTerminal {
       'price', 'markets', 'status', 'inspect', 'delegation', 'delegated',
       'setup', 'faucet',
     ]);
+    // Compute the effective input/lower with magic prefix when needed.
+    // Avoid recursion (would re-hit the backpressure throttle); just prepend
+    // 'magic ' locally and let the magic dispatcher block handle it.
     const firstWord = lower.split(/\s+/)[0] ?? '';
+    let effInput = input;
+    let effLower = lower;
     if (this.config.tradingMode === 'magic' && MAGIC_VERBS.has(firstWord) && !lower.startsWith('magic ')) {
-      // Re-dispatch as `magic <input>` — recurse once with the prefix added.
-      return this.handleInput(`magic ${input.trim()}`);
+      effInput = `magic ${input.trim()}`;
+      effLower = `magic ${lower}`;
     }
 
-    if (lower === 'magic' || lower.startsWith('magic ')) {
+    if (effLower === 'magic' || effLower.startsWith('magic ')) {
       if (this.config.tradingMode !== 'magic') {
         console.log('');
         console.log(chalk.yellow('  `magic` commands require MAGIC TRADING mode. Current mode: ' + this.config.tradingMode));
@@ -2368,7 +2373,7 @@ export class FlashTerminal {
       }
       // Use the original (case-preserving) input for arg extraction. Base58 mint
       // pubkeys lose meaning if lowercased — `EPjFW…` ≠ `epjfw…`.
-      const trimmed = input.trim();
+      const trimmed = effInput.trim();
       const raw = trimmed.toLowerCase() === 'magic' ? 'inspect' : trimmed.slice(6).trim();
       const parts = raw.split(/\s+/);
       const sub = (parts[0] ?? 'inspect').toLowerCase();
