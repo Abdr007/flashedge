@@ -13,11 +13,18 @@
  */
 
 import { z } from 'zod';
+import chalk from 'chalk';
 import { Connection, PublicKey, Transaction, sendAndConfirmTransaction, type Keypair } from '@solana/web3.js';
 import { ToolDefinition, ToolContext, ToolResult, TradeSide } from '../types/index.js';
 import { MagicTradeClient } from '../client/magic-client.js';
 import { validateInstructionPrograms } from '../client/flash-client.js';
 import { loadSession, saveSession, clearSession, listSessions } from '../security/magic-session-store.js';
+import { formatPrice, formatUsd } from '../utils/format.js';
+
+/** Truncate a long base58 string for display: "5oZL8a…m9KJ". */
+function shortSig(s: string): string {
+  return s.length > 16 ? `${s.slice(0, 6)}…${s.slice(-4)}` : s;
+}
 
 /** USDC mints — mainnet vs devnet test stable. */
 const USDC_MINT_MAINNET = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
@@ -430,14 +437,21 @@ export const magicOpen: ToolDefinition = {
       params.leverage as number,
       params.collateralToken as string | undefined,
     );
+    const liqStr = result.liquidationPrice && result.liquidationPrice > 0 ? chalk.yellow(formatPrice(result.liquidationPrice)) : chalk.dim('N/A');
     return {
       success: true,
-      message:
-        `✓ Opened ${params.market} ${params.side} ${params.leverage}x  $${params.collateral} collateral\n` +
-        `  entry: $${result.entryPrice.toFixed(4)}  liq: $${result.liquidationPrice.toFixed(4)}  size: $${result.sizeUsd.toFixed(2)}\n` +
-        `  tx:      ${result.txSignature}\n` +
-        `  solscan: ${solscanTx(result.txSignature, client.network)}\n` +
-        `  ui:      ${flashUiUrl()}    (connect wallet ${client.walletAddress.slice(0, 8)}…)`,
+      message: [
+        '',
+        chalk.green('  Position Opened'),
+        chalk.dim('  ─────────────────'),
+        `  Market:            ${chalk.cyan(String(params.market).toUpperCase())} ${chalk.bold(String(params.side))} ${chalk.dim(`${params.leverage}x`)}`,
+        `  Entry Price:       ${formatPrice(result.entryPrice)}`,
+        `  Size:              ${formatUsd(result.sizeUsd)}`,
+        `  Collateral:        ${formatUsd(params.collateral as number)}`,
+        `  Liquidation Price: ${liqStr}`,
+        `  TX: ${chalk.dim(shortSig(result.txSignature))}  ${chalk.dim(solscanTx(result.txSignature, client.network))}`,
+        '',
+      ].join('\n'),
       txSignature: result.txSignature,
       data: { result },
     };
@@ -459,13 +473,18 @@ export const magicClose: ToolDefinition = {
       params.side as TradeSide,
       params.receiveToken as string | undefined,
     );
+    const pnlColor = result.pnl >= 0 ? chalk.green : chalk.red;
     return {
       success: true,
-      message:
-        `✓ Closed ${params.market} ${params.side}\n` +
-        `  pnl:     $${result.pnl.toFixed(2)}\n` +
-        `  tx:      ${result.txSignature}\n` +
-        `  solscan: ${solscanTx(result.txSignature, client.network)}`,
+      message: [
+        '',
+        chalk.green('  Position Closed'),
+        chalk.dim('  ─────────────────'),
+        `  Market:            ${chalk.cyan(String(params.market).toUpperCase())} ${chalk.bold(String(params.side))}`,
+        `  PnL:               ${pnlColor(formatUsd(result.pnl))}`,
+        `  TX: ${chalk.dim(shortSig(result.txSignature))}  ${chalk.dim(solscanTx(result.txSignature, client.network))}`,
+        '',
+      ].join('\n'),
       txSignature: result.txSignature,
       data: { result },
     };
@@ -485,10 +504,15 @@ export const magicAddCollateral: ToolDefinition = {
     const result = await client.addCollateral(params.market as string, params.side as TradeSide, params.amount as number);
     return {
       success: true,
-      message:
-        `✓ Added $${params.amount} collateral to ${params.market} ${params.side}\n` +
-        `  tx:      ${result.txSignature}\n` +
-        `  solscan: ${solscanTx(result.txSignature, client.network)}`,
+      message: [
+        '',
+        chalk.green('  Collateral Added'),
+        chalk.dim('  ─────────────────'),
+        `  Market:            ${chalk.cyan(String(params.market).toUpperCase())} ${chalk.bold(String(params.side))}`,
+        `  Amount:            ${formatUsd(params.amount as number)}`,
+        `  TX: ${chalk.dim(shortSig(result.txSignature))}  ${chalk.dim(solscanTx(result.txSignature, client.network))}`,
+        '',
+      ].join('\n'),
       txSignature: result.txSignature,
     };
   },
@@ -511,10 +535,15 @@ export const magicRemoveCollateral: ToolDefinition = {
     );
     return {
       success: true,
-      message:
-        `✓ Removed $${params.amount} collateral from ${params.market} ${params.side}\n` +
-        `  tx:      ${result.txSignature}\n` +
-        `  solscan: ${solscanTx(result.txSignature, client.network)}`,
+      message: [
+        '',
+        chalk.green('  Collateral Removed'),
+        chalk.dim('  ─────────────────'),
+        `  Market:            ${chalk.cyan(String(params.market).toUpperCase())} ${chalk.bold(String(params.side))}`,
+        `  Amount:            ${formatUsd(params.amount as number)}`,
+        `  TX: ${chalk.dim(shortSig(result.txSignature))}  ${chalk.dim(solscanTx(result.txSignature, client.network))}`,
+        '',
+      ].join('\n'),
       txSignature: result.txSignature,
     };
   },

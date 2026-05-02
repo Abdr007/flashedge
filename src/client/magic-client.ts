@@ -295,7 +295,7 @@ export class MagicTradeClient implements IFlashClient {
     if (filter) {
       const cfg = this.poolConfig.custodies.find((c) => c.symbol === filter);
       if (cfg) {
-        const px = await this.fetchOraclePrice(cfg.symbol).catch(() => 0);
+        const px = await this.fetchOraclePrice(cfg.symbol, undefined, TradeSide.Long).catch(() => 0);
         priceMap.set(cfg.symbol, px);
       }
     }
@@ -321,29 +321,26 @@ export class MagicTradeClient implements IFlashClient {
   }
 
   /**
-   * Read a custody's oracle price via the SDK's getOraclePrice view ix.
-   * Builds the ix, simulates via the ER ViewHelper, decodes the return.
-   * ~50-100ms per call — parallelizable.
+   * Get the current oracle/entry price for a target symbol using the SDK's
+   * typed `getEntryPriceAndFee` view. Pass a size of 1 base unit so fees ≈ 0
+   * and the returned `entry_price` is effectively the spot oracle price.
+   *
+   * Why not `sdk.getOraclePrice`? It returns just the raw ix and the IDL
+   * doesn't declare a typed `returns` field, so the SDK's ViewHelper.decodeLogs
+   * errors with "View expected return type". `getEntryPriceAndFee` is fully
+   * typed — same simulate cost (~50-100ms) and we get a fee estimate too.
    */
-  async fetchOraclePrice(custodySymbol: string): Promise<number> {
-    const ix = await this.sdk.getOraclePrice(custodySymbol, this.poolConfig);
-    const tx = new Transaction().add(ix);
-    tx.feePayer = this.wallet.publicKey;
-    const helper = (this.sdk as unknown as { erViewHelper?: unknown; viewHelper: unknown }).erViewHelper
-      ?? (this.sdk as unknown as { viewHelper: unknown }).viewHelper;
-    if (!helper) return 0;
-    const sim = await (helper as {
-      simulateTransaction: (
-        tx: Transaction,
-        alt?: unknown[],
-        userPk?: PublicKey,
-      ) => Promise<{ value: { logs?: string[] } }>;
-    }).simulateTransaction(tx, [], this.wallet.publicKey);
-    const ixIdx = (helper as { findInstructionIndex: (n: string) => number }).findInstructionIndex('getOraclePrice');
-    const decoded = (helper as {
-      decodeLogs: <T>(d: unknown, ixIdx: number, name?: string) => T | undefined;
-    }).decodeLogs<{ price: BN; exponent: number }>(sim, ixIdx, 'getOraclePrice');
-    return decoded ? priceToNumber(decoded) : 0;
+  async fetchOraclePrice(targetSymbol: string, lockSymbol?: string, side: TradeSide = TradeSide.Long): Promise<number> {
+    const lock = lockSymbol ?? this.resolveMarket(targetSymbol, side).lockSymbol;
+    const sdkSide = side === TradeSide.Long ? Side.Long : Side.Short;
+    const result = await this.sdk.getEntryPriceAndFee(
+      targetSymbol,
+      lock,
+      sdkSide,
+      this.poolConfig,
+      new BN(1),
+    );
+    return priceToNumber(result.entryPrice as { price: BN; exponent: number });
   }
 
   // ─── IFlashClient: trades ──────────────────────────────────────────────────
@@ -413,7 +410,7 @@ export class MagicTradeClient implements IFlashClient {
       // breaks for SOL Long (lock=SOL) when paying with USDC. Local math:
       //   sizeUsd     = collateralUsd × leverage
       //   sizeAmount  = sizeUsd / oraclePrice × 10^targetDecimals
-      const oraclePrice = await this.fetchOraclePrice(targetSymbol);
+      const oraclePrice = await this.fetchOraclePrice(targetSymbol, lockSymbol, side);
       if (!Number.isFinite(oraclePrice) || oraclePrice <= 0) {
         throw new Error(
           `[magic-mode] could not fetch oracle price for ${targetSymbol} — refusing to open position with unknown size`,
@@ -1076,7 +1073,7 @@ export class MagicTradeClient implements IFlashClient {
     const livePerPos = await Promise.all(
       enriched.map(async (e) => {
         const tasks = [
-          this.fetchOraclePrice(e.targetSymbol).catch(() => 0),
+          this.fetchOraclePrice(e.targetSymbol, e.lockSymbol, e.sideStr).catch(() => 0),
           this.sdk.getPnl(owner, e.targetSymbol, e.lockSymbol, e.sdkSide, this.poolConfig).catch(() => null),
           this.sdk.getLiquidationPrice(owner, e.targetSymbol, e.lockSymbol, e.sdkSide, this.poolConfig).catch(() => null),
         ] as const;
