@@ -2318,6 +2318,10 @@ export class FlashTerminal {
           case 'verify':
           case 'parity':
             return { tool: 'magicVerify', params: {} };
+          case 'price': {
+            if (parts.length < 2) return { error: 'usage: magic price <symbol>' };
+            return { tool: 'magicPrice', params: { market: parts[1] } };
+          }
           case 'markets':
             return { tool: 'magicMarkets', params: {} };
           case 'delegation':

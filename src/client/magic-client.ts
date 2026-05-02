@@ -647,12 +647,25 @@ export class MagicTradeClient implements IFlashClient {
 
   // ─── Session keys (P3 wires creation; activation is here) ─────────────────
 
-  /** Activate a previously-created session keypair for ER trades. */
+  /**
+   * Track a session keypair locally for future use.
+   *
+   * NOTE: We deliberately do NOT call `this.sdk.useSession()` here, because
+   * session_token PDAs created via `gum_session_keys` live on L1 — the
+   * MagicBlock ER (which actually executes our trade ixs) can't see them
+   * without delegation. Including a session_token in an ER ix triggers
+   * `Custom(3012) AccountNotInitialized` from the FMT program.
+   *
+   * Until the SDK / Flash protocol ship session-token-on-ER, the CLI
+   * signs every trade with the owner keypair. This is still fast: no
+   * wallet popup (we read the keypair file), no rate-limit on prompts.
+   */
   useSession(sessionKp: Keypair, expiresAt: number): void {
     this.sessionKeypair = sessionKp;
     this.sessionExpiresAt = expiresAt;
-    this.sdk.useSession(sessionKp.publicKey);
-    log.info('magic-client', `session activated ${sessionKp.publicKey.toBase58().slice(0, 8)}… expires=${new Date(expiresAt * 1000).toISOString()}`);
+    // Intentionally NOT activating on the SDK — see note above.
+    // this.sdk.useSession(sessionKp.publicKey);
+    log.info('magic-client', `session loaded (owner-signed for ER until session-on-ER lands) ${sessionKp.publicKey.toBase58().slice(0, 8)}…`);
   }
 
   clearSession(): void {
@@ -661,6 +674,11 @@ export class MagicTradeClient implements IFlashClient {
     this.sdk.useSession(null);
   }
 
+  /**
+   * Returns true if a session keypair is loaded and unexpired. We keep it
+   * around for L1 ops that already work with sessions (createSession/revoke);
+   * ER trade signing is unaffected — the owner wallet is always used there.
+   */
   hasActiveSession(): boolean {
     if (!this.sessionKeypair) return false;
     return this.sessionExpiresAt > Date.now() / 1000;
@@ -818,12 +836,11 @@ export class MagicTradeClient implements IFlashClient {
       throw new Error('[magic-mode] owner keypair integrity check failed — refusing to sign');
     }
 
-    // ER transport requires Keypair[]. Owner pays unless a session is active,
-    // in which case the session signer comes first; SDK matches by pubkey.
-    const signers: Keypair[] = this.hasActiveSession() && this.sessionKeypair
-      ? [this.sessionKeypair, this.wallet]
-      : [this.wallet];
-
+    // Owner-signed ER trades for now. Session keys aren't usable here yet —
+    // session_token PDAs live on L1 and the ER can't see them, so passing one
+    // into openPosition triggers `Custom(3012) AccountNotInitialized`.
+    // Reading the keypair from disk is sub-ms, so this is still fast.
+    const signers: Keypair[] = [this.wallet];
     for (const s of additionalSigners) {
       if ((s as Keypair).secretKey) signers.push(s as Keypair);
     }

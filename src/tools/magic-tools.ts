@@ -676,12 +676,50 @@ export const magicSessionStatus: ToolDefinition = {
   },
 };
 
+/**
+ * Report the spot price for a market via the on-chain oracle, plus the oracle
+ * account pubkey so the user can cross-check on Solscan/Pyth/etc.
+ */
+export const magicPrice: ToolDefinition = {
+  name: 'magicPrice',
+  description: 'Query on-chain oracle price for a market and show the oracle account so it can be verified externally.',
+  parameters: z.object({ market: z.string() }),
+  async execute(params, context): Promise<ToolResult> {
+    const client = buildMagicClient(context);
+    const sym = String(params.market).toUpperCase();
+    const cust = client.poolConfig.custodies.find((c) => c.symbol === sym);
+    if (!cust) {
+      return { success: false, message: `Unknown market '${sym}'. Run \`magic markets\` to see available symbols.` };
+    }
+    const price = await client.fetchOraclePrice(sym).catch((err) => {
+      throw new Error(`oracle read failed: ${(err as Error).message}`);
+    });
+    const lines = [
+      '',
+      chalk.cyan(`  ${sym} on Pool.0`),
+      chalk.dim('  ─────────────────'),
+      `  Spot Price:        ${formatPrice(price)}`,
+      `  Custody:           ${cust.custodyAccount.toBase58()}`,
+      `    → solscan:       ${solscanAcct(cust.custodyAccount.toBase58(), client.network)}`,
+      `  Internal Oracle:   ${cust.intOracleAccount.toBase58()}`,
+      `    → solscan:       ${solscanAcct(cust.intOracleAccount.toBase58(), client.network)}`,
+      `  External Oracle:   ${cust.extOracleAccount.toBase58()}  ${chalk.dim(`(${cust.pythTicker})`)}`,
+      `    → solscan:       ${solscanAcct(cust.extOracleAccount.toBase58(), client.network)}`,
+      '',
+      chalk.dim('  Cross-check: paste the oracle account into pyth.network or solscan to see the same price.'),
+      '',
+    ];
+    return { success: true, message: lines.join('\n'), data: { symbol: sym, price, custody: cust.custodyAccount.toBase58() } };
+  },
+};
+
 export const magicTools: ToolDefinition[] = [
   magicInspect,
   magicStatus,
   magicDelegation,
   magicPortfolio,
   magicVerify,
+  magicPrice,
   magicMarkets,
   magicSetup,
   magicDeposit,
