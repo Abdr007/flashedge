@@ -398,37 +398,59 @@ export class MagicTradeClient implements IFlashClient {
       }
 
       const collateralCustody = this.poolConfig.getCustodyFromSymbol(collateralSymbol);
-      const targetCustody = this.poolConfig.getCustodyFromSymbol(targetSymbol);
       const lockCustody = this.poolConfig.getCustodyFromSymbol(lockSymbol);
       const collateralRaw = new BN(Math.floor(collateralAmount * 10 ** collateralCustody.decimals));
-
-      // Compute size locally from on-chain oracle. We avoid getOpenPositionQuote
-      // because its internal market lookup uses collateralSymbol as lockSymbol —
-      // breaks for SOL Long (lock=SOL) when paying with USDC. Local math:
-      //   sizeUsd     = collateralUsd × leverage
-      //   sizeAmount  = sizeUsd / oraclePrice × 10^targetDecimals
-      const oraclePrice = await this.fetchOraclePrice(targetSymbol, lockSymbol, side);
-      if (!Number.isFinite(oraclePrice) || oraclePrice <= 0) {
-        throw new Error(
-          `[magic-mode] could not fetch oracle price for ${targetSymbol} — refusing to open position with unknown size`,
-        );
-      }
-      const sizeRaw = new BN(Math.floor((sizeUsd / oraclePrice) * 10 ** targetCustody.decimals));
+      const leverageBps = new BN(Math.round(leverage * 10_000));
 
       let result: { instructions: TransactionInstruction[]; additionalSigners: Signer[] };
+      let entryPriceForReturn = 0;
+      let liqPriceForReturn = 0;
 
       if (collateralSymbol === lockSymbol) {
-        // Same-token path: user already deposited the lock token. Plain openPosition.
+        // Same-token path. Get the SDK's canonical sizing from getOpenPositionQuote
+        // so our params exactly match what the program expects (down to the bps
+        // for fees/slippage). Local calc was off by 0.1% which the program
+        // appears to reject.
+        const quote = await this.sdk.getOpenPositionQuote(
+          targetSymbol,
+          collateralSymbol,
+          sdkSide,
+          this.poolConfig,
+          collateralRaw,
+          leverageBps,
+          undefined,
+          null,
+          null,
+          null,
+          this.basketPda,
+        );
+        const collateralRawForIx = quote.collateralAmount as BN;
+        const sizeRawForIx = quote.sizeAmount as BN;
+        entryPriceForReturn = priceToNumber(quote.entryPrice as { price: BN; exponent: number });
+        liqPriceForReturn = priceToNumber(quote.liquidationPrice as { price: BN; exponent: number });
+
         result = await this.sdk.openPosition(
           targetSymbol,
           lockSymbol,
           collateralSymbol,
           sdkSide,
           this.poolConfig,
-          collateralRaw,
-          sizeRaw,
+          collateralRawForIx,
+          sizeRawForIx,
         );
       } else {
+        // Cross-token: compute size locally from oracle (quote can't be used —
+        // its internal market lookup uses collateralSymbol as lockSymbol, which
+        // is the wrong market for SOL Long with USDC pay).
+        const oraclePrice = await this.fetchOraclePrice(targetSymbol, lockSymbol, side);
+        if (!Number.isFinite(oraclePrice) || oraclePrice <= 0) {
+          throw new Error(
+            `[magic-mode] could not fetch oracle price for ${targetSymbol} — refusing to open position with unknown size`,
+          );
+        }
+        entryPriceForReturn = oraclePrice;
+        const targetCustody = this.poolConfig.getCustodyFromSymbol(targetSymbol);
+        const sizeRaw = new BN(Math.floor((sizeUsd / oraclePrice) * 10 ** targetCustody.decimals));
         // Cross-token path: user is paying in `collateralSymbol` (e.g., USDC), but
         // the market locks `lockSymbol` (e.g., SOL for SOL Long). The program needs
         // its collateral in the lock token, so we use `swapAndOpenPosition` which
@@ -476,8 +498,8 @@ export class MagicTradeClient implements IFlashClient {
 
       return {
         txSignature: sig,
-        entryPrice: oraclePrice,
-        liquidationPrice: 0, // computed live by `magic portfolio` via getLiquidationPrice
+        entryPrice: entryPriceForReturn,
+        liquidationPrice: liqPriceForReturn,
         sizeUsd,
       };
     } catch (err) {
