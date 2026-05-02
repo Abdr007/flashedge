@@ -1312,36 +1312,34 @@ export class FlashTerminal {
     // ─── Quick Start Hints ───────────────────────────────────────
     console.log(theme.section('  Quick Start'));
     if (isMagic) {
-      // Magic mode — show every magic command grouped by category.
       console.log('');
       console.log(`  ${theme.dim('Trading')}`);
-      console.log(`    ${theme.command('magic open <sym> <long|short> <coll> <lev>')}    Open position (e.g. ${theme.dim('magic open SOL short 5 2')})`);
-      console.log(`    ${theme.command('magic close <sym> <long|short> [recv]')}        Close position`);
-      console.log(`    ${theme.command('magic add <sym> <long|short> <usd>')}            Add collateral`);
-      console.log(`    ${theme.command('magic remove <sym> <long|short> <usd>')}         Remove collateral`);
+      console.log(`    ${theme.command('magic open SOL long 10 2')}      Open SOL long, $10 collateral, 2x leverage`);
+      console.log(`    ${theme.command('magic open BTC short 50 5')}     Open BTC short, $50 collateral, 5x leverage`);
+      console.log(`    ${theme.command('magic close SOL long')}          Close SOL long, payout in USDC`);
+      console.log(`    ${theme.command('magic add SOL long 25')}         Add $25 collateral to SOL long`);
+      console.log(`    ${theme.command('magic remove SOL long 10')}      Remove $10 collateral from SOL long`);
       console.log('');
       console.log(`  ${theme.dim('Vault')}`);
-      console.log(`    ${theme.command('magic deposit <symbol|mint> <amount>')}          Deposit to vault`);
-      console.log(`    ${theme.command('magic withdraw <symbol|mint> <amount>')}         Withdraw from vault`);
-      console.log(`    ${theme.command('magic settle [symbol]')}                         Drain pending credits/debits`);
+      console.log(`    ${theme.command('magic deposit USDC 100')}        Deposit 100 USDC into the vault`);
+      console.log(`    ${theme.command('magic deposit SOL 0.5')}         Deposit 0.5 SOL into the vault`);
+      console.log(`    ${theme.command('magic withdraw USDC 50')}        Withdraw 50 USDC from the vault`);
+      console.log(`    ${theme.command('magic settle')}                  Drain pending credits/debits across all tokens`);
+      console.log(`    ${theme.command('magic settle USDC')}             Settle just one custody`);
       console.log('');
       console.log(`  ${theme.dim('Inspect')}`);
-      console.log(`    ${theme.command('magic portfolio')}             Live PnL / mark / liq per position`);
-      console.log(`    ${theme.command('magic verify')}                CLI ↔ UI parity check`);
-      console.log(`    ${theme.command('magic price <symbol>')}        Current oracle price`);
-      console.log(`    ${theme.command('magic markets')}               All 52 markets + leverage caps`);
-      console.log(`    ${theme.command('magic status')}                Wallet preflight (SOL, UDL, basket)`);
-      console.log(`    ${theme.command('magic inspect')}               Network + pool + program + custodies`);
-      console.log(`    ${theme.command('magic delegation')}            Basket delegation status`);
-      console.log('');
-      console.log(`  ${theme.dim('Setup')}`);
-      console.log(`    ${theme.command('magic setup')}                 One-time: init UDL + basket + delegate`);
-      console.log(`    ${theme.command('magic faucet')}                Devnet SOL + test stable links`);
+      console.log(`    ${theme.command('magic portfolio')}               Live PnL / mark / liq per position`);
+      console.log(`    ${theme.command('magic verify')}                  CLI ↔ UI parity check`);
+      console.log(`    ${theme.command('magic price SOL')}               Current SOL oracle price`);
+      console.log(`    ${theme.command('magic markets')}                 All 52 markets + leverage caps`);
+      console.log(`    ${theme.command('magic status')}                  Wallet preflight (SOL, UDL, basket)`);
+      console.log(`    ${theme.command('magic inspect')}                 Network + pool + program + custodies`);
+      console.log(`    ${theme.command('magic delegation')}              Basket delegation status`);
       console.log('');
       console.log(`  ${theme.dim('General')}`);
-      console.log(`    ${theme.command('help')}                        Full command list (all categories)`);
-      console.log(`    ${theme.command('wallet tokens')}               Wallet token balances`);
-      console.log(`    ${theme.command('exit')}                        Close terminal`);
+      console.log(`    ${theme.command('help')}                          Full command list (all categories)`);
+      console.log(`    ${theme.command('wallet tokens')}                 Wallet token balances`);
+      console.log(`    ${theme.command('exit')}                          Close terminal`);
     } else {
       console.log(`    ${theme.command('help')}           List all commands`);
       console.log(`    ${theme.command('dashboard')}      Protocol & portfolio overview`);
