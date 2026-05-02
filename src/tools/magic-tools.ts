@@ -717,9 +717,18 @@ export const magicVault: ToolDefinition = {
       };
     }
 
+    // Pad raw strings BEFORE chalk styling — chalk wraps text with ANSI
+    // escape codes that count toward .padEnd's length and break alignment.
+    const COL_TOK = 8;
+    const COL_DEP = 18;
+    const COL_LOCK = 18;
     const lines: string[] = ['', chalk.cyan('  💰 Vault'), sep];
     lines.push(
-      `  ${chalk.dim('Token').padEnd(8)}${chalk.dim('Deposits').padEnd(20)}${chalk.dim('Locked').padEnd(20)}${chalk.dim('Available')}`,
+      '  ' +
+        chalk.dim('Token'.padEnd(COL_TOK)) +
+        chalk.dim('Deposits'.padEnd(COL_DEP)) +
+        chalk.dim('Locked'.padEnd(COL_LOCK)) +
+        chalk.dim('Available'),
     );
     let totalAvailUsd = 0;
     for (const [sym, bal] of balances) {
@@ -728,14 +737,17 @@ export const magicVault: ToolDefinition = {
       const locked = bal.debits - bal.pendingCredits;
       const availColor = bal.available > 0.01 ? chalk.green : chalk.red;
       lines.push(
-        `  ${chalk.bold(sym.padEnd(6))}  ${fmt(bal.deposits).padEnd(18)}${fmt(Math.max(locked, 0)).padEnd(18)}${availColor(fmt(bal.available))}`,
+        '  ' +
+          chalk.bold(sym.padEnd(COL_TOK)) +
+          fmt(bal.deposits).padEnd(COL_DEP) +
+          fmt(Math.max(locked, 0)).padEnd(COL_LOCK) +
+          availColor(fmt(bal.available)),
       );
-      // Tally USD-equivalent for stables only.
       const isStable = client.poolConfig.tokens.find((t) => t.symbol === sym)?.isStable;
       if (isStable) totalAvailUsd += bal.available;
     }
     lines.push(sep);
-    lines.push(`  ${chalk.dim('Available stable')} ${chalk.bold(formatUsd(totalAvailUsd))}`);
+    lines.push(`  ${chalk.dim('Available stable')}  ${chalk.bold(formatUsd(totalAvailUsd))}`);
     lines.push('');
     return { success: true, message: lines.join('\n'), data: { balances: Object.fromEntries(balances) } };
   },

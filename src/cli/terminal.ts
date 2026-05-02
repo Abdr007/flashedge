@@ -2401,58 +2401,74 @@ export class FlashTerminal {
             return { tool: 'magicWithdraw', params: { token: parts[1], amount } };
           }
           case 'open': {
-            // magic open <symbol> <long|short> <collateralUsd> <leverage> [collateralToken]
-            if (parts.length < 5) return { error: 'usage: magic open <symbol> <long|short> <collateral_usd> <leverage> [collateralToken]' };
-            const side = parts[2];
-            if (side !== 'long' && side !== 'short') return { error: `side must be 'long' or 'short' (got '${side}')` };
-            const collateral = Number(parts[3]);
-            const leverage = Number(parts[4]);
-            if (!Number.isFinite(collateral) || collateral <= 0) return { error: `collateral must be a positive number (got '${parts[3]}')` };
-            if (!Number.isFinite(leverage) || leverage <= 0) return { error: `leverage must be a positive number (got '${parts[4]}')` };
+            // Defer to v1's flexible parser so all forms work:
+            //   magic open SOL long 10 2
+            //   magic open sol long 2x $10
+            //   magic open 5x short btc $50
+            //   magic open SOL long 10 dollars 2x
+            const argString = parts.slice(1).join(' ');
+            const parsed = localParse(`open ${argString}`);
+            if (!parsed || parsed.action !== ActionType.OpenPosition) {
+              return { error: 'usage: magic open <symbol> <long|short> <collateral_usd> <leverage>  (e.g. `magic open SOL long 10 2x`)' };
+            }
+            const p = parsed as { market: string; side: TradeSide; collateral: number; leverage: number };
             return {
               tool: 'magicOpen',
               params: {
-                market: parts[1],
-                side,
-                collateral,
-                leverage,
-                ...(parts[5] ? { collateralToken: parts[5] } : {}),
+                market: String(p.market),
+                side: String(p.side),
+                collateral: Number(p.collateral),
+                leverage: Number(p.leverage),
+                // collateralToken stays default USDC unless explicitly typed as a separate trailing token; v1 parser strips it
               },
             };
           }
           case 'close': {
-            // magic close <symbol> <long|short> [receiveToken]
-            if (parts.length < 3) return { error: 'usage: magic close <symbol> <long|short> [receiveToken]' };
-            const side = parts[2];
-            if (side !== 'long' && side !== 'short') return { error: `side must be 'long' or 'short' (got '${side}')` };
-            return {
-              tool: 'magicClose',
-              params: {
-                market: parts[1],
-                side,
-                ...(parts[3] ? { receiveToken: parts[3] } : {}),
-              },
-            };
+            // V1 parser first; if it can't, fall back to positional.
+            const argString = parts.slice(1).join(' ');
+            const parsed = localParse(`close ${argString}`);
+            if (parsed && parsed.action === ActionType.ClosePosition) {
+              const p = parsed as { market: string; side: TradeSide };
+              return { tool: 'magicClose', params: { market: String(p.market), side: String(p.side) } };
+            }
+            // Fallback: `close <symbol> <side>` positional
+            if (parts.length >= 3 && (parts[2] === 'long' || parts[2] === 'short')) {
+              return { tool: 'magicClose', params: { market: parts[1], side: parts[2] } };
+            }
+            return { error: 'usage: magic close <symbol> <long|short>  (e.g. `magic close SOL long`)' };
           }
           case 'add':
           case 'add-collateral': {
-            // magic add <symbol> <long|short> <amountUsd>
-            if (parts.length < 4) return { error: 'usage: magic add <symbol> <long|short> <amount_usd>' };
-            const side = parts[2];
-            if (side !== 'long' && side !== 'short') return { error: `side must be 'long' or 'short' (got '${side}')` };
-            const amount = Number(parts[3]);
-            if (!Number.isFinite(amount) || amount <= 0) return { error: `amount must be a positive number (got '${parts[3]}')` };
-            return { tool: 'magicAddCollateral', params: { market: parts[1], side, amount } };
+            const argString = parts.slice(1).join(' ');
+            const parsed = localParse(`add ${argString}`);
+            if (parsed && parsed.action === ActionType.AddCollateral) {
+              const p = parsed as { market: string; side: TradeSide; amount: number };
+              return { tool: 'magicAddCollateral', params: { market: String(p.market), side: String(p.side), amount: Number(p.amount) } };
+            }
+            // Fallback: `add <symbol> <side> <amount>` positional with $-strip
+            if (parts.length >= 4 && (parts[2] === 'long' || parts[2] === 'short')) {
+              const amount = Number(String(parts[3]).replace(/[$,]/g, ''));
+              if (Number.isFinite(amount) && amount > 0) {
+                return { tool: 'magicAddCollateral', params: { market: parts[1], side: parts[2], amount } };
+              }
+            }
+            return { error: 'usage: magic add <symbol> <long|short> <amount_usd>  (e.g. `magic add SOL long $25`)' };
           }
           case 'remove':
           case 'remove-collateral': {
-            // magic remove <symbol> <long|short> <amountUsd>
-            if (parts.length < 4) return { error: 'usage: magic remove <symbol> <long|short> <amount_usd>' };
-            const side = parts[2];
-            if (side !== 'long' && side !== 'short') return { error: `side must be 'long' or 'short' (got '${side}')` };
-            const amount = Number(parts[3]);
-            if (!Number.isFinite(amount) || amount <= 0) return { error: `amount must be a positive number (got '${parts[3]}')` };
-            return { tool: 'magicRemoveCollateral', params: { market: parts[1], side, amount } };
+            const argString = parts.slice(1).join(' ');
+            const parsed = localParse(`remove ${argString}`);
+            if (parsed && parsed.action === ActionType.RemoveCollateral) {
+              const p = parsed as { market: string; side: TradeSide; amount: number };
+              return { tool: 'magicRemoveCollateral', params: { market: String(p.market), side: String(p.side), amount: Number(p.amount) } };
+            }
+            if (parts.length >= 4 && (parts[2] === 'long' || parts[2] === 'short')) {
+              const amount = Number(String(parts[3]).replace(/[$,]/g, ''));
+              if (Number.isFinite(amount) && amount > 0) {
+                return { tool: 'magicRemoveCollateral', params: { market: parts[1], side: parts[2], amount } };
+              }
+            }
+            return { error: 'usage: magic remove <symbol> <long|short> <amount_usd>' };
           }
           case 'session': {
             return {
