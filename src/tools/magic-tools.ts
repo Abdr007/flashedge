@@ -28,18 +28,40 @@ function shortSig(s: string): string {
 const USDC_MINT_MAINNET = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 const USDC_MINT_DEVNET = 'Gh9ZwEmdLJ8DscKNTkTqPbNwLNNBjuSzaG9Vp2KGtKJr';
 
-/** Build a Solscan tx URL with cluster query for devnet. */
-function solscanTx(sig: string, network: 'mainnet-beta' | 'devnet'): string {
-  return network === 'devnet'
-    ? `https://solscan.io/tx/${sig}?cluster=devnet`
-    : `https://solscan.io/tx/${sig}`;
+/**
+ * Pick the explorer base host. Default: Solana Explorer.
+ * Override via FLASH_EXPLORER=solscan (or =explorer to be explicit).
+ *
+ * For magic-mode mainnet trades, all writes hit the ER, so the tx is only
+ * visible to clients pointed at the ER's RPC. Both Solscan and Solana Explorer
+ * accept `?cluster=custom&customUrl=<er>`. URL-encoded so the link copies
+ * cleanly into a browser bar without breaking on `://`.
+ */
+function explorerBase(): { tx: string; acct: string } {
+  const which = (process.env.FLASH_EXPLORER ?? 'explorer').toLowerCase();
+  if (which === 'solscan') return { tx: 'https://solscan.io/tx', acct: 'https://solscan.io/account' };
+  return { tx: 'https://explorer.solana.com/tx', acct: 'https://explorer.solana.com/address' };
 }
 
-/** Build a Solscan account URL. */
+/** ER router URL — magic-mode trades land here on mainnet. */
+const MAGIC_ER_URL = 'https://flashtrade.magicblock.app/';
+
+/** Build a tx explorer URL. For magic mainnet, includes the ER customUrl. */
+function solscanTx(sig: string, network: 'mainnet-beta' | 'devnet'): string {
+  const { tx } = explorerBase();
+  if (network === 'devnet') return `${tx}/${sig}?cluster=devnet`;
+  // Magic mainnet — point at the ER router so the tx resolves.
+  return `${tx}/${sig}?cluster=custom&customUrl=${encodeURIComponent(MAGIC_ER_URL)}`;
+}
+
+/** Build an account explorer URL. */
 function solscanAcct(addr: string, network: 'mainnet-beta' | 'devnet'): string {
-  return network === 'devnet'
-    ? `https://solscan.io/account/${addr}?cluster=devnet`
-    : `https://solscan.io/account/${addr}`;
+  const { acct } = explorerBase();
+  if (network === 'devnet') return `${acct}/${addr}?cluster=devnet`;
+  // For accounts on magic-mode mainnet, the on-chain account is also on L1
+  // (UDL is L1-only, basket is delegated). Keep the link to L1 mainnet so
+  // the user always sees the canonical state.
+  return `${acct}/${addr}`;
 }
 
 /** Flash UI URL — opens in the user's connected-wallet view. */
