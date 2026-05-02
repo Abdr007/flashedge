@@ -398,88 +398,44 @@ export class MagicTradeClient implements IFlashClient {
       }
 
       const collateralCustody = this.poolConfig.getCustodyFromSymbol(collateralSymbol);
-      const lockCustody = this.poolConfig.getCustodyFromSymbol(lockSymbol);
       const collateralRaw = new BN(Math.floor(collateralAmount * 10 ** collateralCustody.decimals));
       const leverageBps = new BN(Math.round(leverage * 10_000));
 
-      let result: { instructions: TransactionInstruction[]; additionalSigners: Signer[] };
-      let entryPriceForReturn = 0;
-      let liqPriceForReturn = 0;
+      // Mirror the official Flash UI's pattern:
+      //   - Always plain openPosition (no swapAndOpenPosition — the program handles
+      //     cross-token via the receivingCustody account internally).
+      //   - getOpenPositionQuote takes the LOCK symbol as `collateralSymbol` (for
+      //     its market lookup) and the user's pay token as `receivingSymbol`.
+      //   - openPosition takes (target, lock, collateral=user-pay-token).
+      //
+      // This is the same shape as the official UI's tx (verified on-chain).
+      const quote = await this.sdk.getOpenPositionQuote(
+        targetSymbol,
+        lockSymbol,         // → SDK uses this for findMarketConfig
+        sdkSide,
+        this.poolConfig,
+        collateralRaw,
+        leverageBps,
+        collateralSymbol,   // → receivingSymbol = user's actual pay token
+        null,
+        null,
+        null,
+        this.basketPda,
+      );
+      const collateralRawForIx = quote.collateralAmount as BN;
+      const sizeRawForIx = quote.sizeAmount as BN;
+      const entryPriceForReturn = priceToNumber(quote.entryPrice as { price: BN; exponent: number });
+      const liqPriceForReturn = priceToNumber(quote.liquidationPrice as { price: BN; exponent: number });
 
-      if (collateralSymbol === lockSymbol) {
-        // Same-token path. Get the SDK's canonical sizing from getOpenPositionQuote
-        // so our params exactly match what the program expects (down to the bps
-        // for fees/slippage). Local calc was off by 0.1% which the program
-        // appears to reject.
-        const quote = await this.sdk.getOpenPositionQuote(
-          targetSymbol,
-          collateralSymbol,
-          sdkSide,
-          this.poolConfig,
-          collateralRaw,
-          leverageBps,
-          undefined,
-          null,
-          null,
-          null,
-          this.basketPda,
-        );
-        const collateralRawForIx = quote.collateralAmount as BN;
-        const sizeRawForIx = quote.sizeAmount as BN;
-        entryPriceForReturn = priceToNumber(quote.entryPrice as { price: BN; exponent: number });
-        liqPriceForReturn = priceToNumber(quote.liquidationPrice as { price: BN; exponent: number });
-
-        result = await this.sdk.openPosition(
-          targetSymbol,
-          lockSymbol,
-          collateralSymbol,
-          sdkSide,
-          this.poolConfig,
-          collateralRawForIx,
-          sizeRawForIx,
-        );
-      } else {
-        // Cross-token: compute size locally from oracle (quote can't be used —
-        // its internal market lookup uses collateralSymbol as lockSymbol, which
-        // is the wrong market for SOL Long with USDC pay).
-        const oraclePrice = await this.fetchOraclePrice(targetSymbol, lockSymbol, side);
-        if (!Number.isFinite(oraclePrice) || oraclePrice <= 0) {
-          throw new Error(
-            `[magic-mode] could not fetch oracle price for ${targetSymbol} — refusing to open position with unknown size`,
-          );
-        }
-        entryPriceForReturn = oraclePrice;
-        const targetCustody = this.poolConfig.getCustodyFromSymbol(targetSymbol);
-        const sizeRaw = new BN(Math.floor((sizeUsd / oraclePrice) * 10 ** targetCustody.decimals));
-        // Cross-token path: user is paying in `collateralSymbol` (e.g., USDC), but
-        // the market locks `lockSymbol` (e.g., SOL for SOL Long). The program needs
-        // its collateral in the lock token, so we use `swapAndOpenPosition` which
-        // bundles a swap + open in one ix.
-        //
-        // For SOL Long with $10 USDC at SOL=$84:
-        //   receivingAmount   = 10 USDC raw      (user's input)
-        //   collateralAmount  = 0.119 SOL raw    (= $10 of SOL post-swap)
-        //   sizeAmount        = 0.238 SOL raw    (= $20 of SOL = collateral × leverage)
-        const lockEquivRaw = new BN(
-          Math.floor((collateralAmount / oraclePrice) * 10 ** lockCustody.decimals),
-        );
-        // 1% slippage tolerance on the swap output — Flash's pool typically routes
-        // the trade with minimal slippage, but tighten/loosen via env var if needed.
-        const minTargetAmount = lockEquivRaw.muln(99).divn(100);
-        result = await this.sdk.swapAndOpenPosition(
-          targetSymbol,
-          collateralSymbol, // SDK calls this `receivingSymbol` — user's input token
-          lockSymbol,       // SDK calls this `collateralSymbol` — the lock
-          sdkSide,
-          this.poolConfig,
-          {
-            receivingAmount: collateralRaw,
-            minTargetAmount,
-            collateralAmount: lockEquivRaw,
-            sizeAmount: sizeRaw,
-          },
-        );
-      }
+      const result = await this.sdk.openPosition(
+        targetSymbol,
+        lockSymbol,
+        collateralSymbol,
+        sdkSide,
+        this.poolConfig,
+        collateralRawForIx,
+        sizeRawForIx,
+      );
 
       const sig = await this.sendErIxs(result.instructions, result.additionalSigners, 'magic.openPosition');
       this.recordRecentTrade(cacheKey, sig);
