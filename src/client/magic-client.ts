@@ -676,6 +676,32 @@ export class MagicTradeClient implements IFlashClient {
     return this.sendL1Ixs(result.instructions, result.additionalSigners, 'magic.depositDirect');
   }
 
+  /**
+   * Withdraw collateral from the vault — two-step process bundled here:
+   *   1. Request: marks the withdrawal in the UDL + ER, commits state to L1.
+   *   2. Settle:  releases the tokens from the platform vault back to user's ATA.
+   * Returns both signatures.
+   */
+  async withdraw(
+    tokenMint: PublicKey,
+    amountRaw: bigint,
+  ): Promise<{ requestSig: string; settleSig: string }> {
+    const validatorKey = await this.fetchClosestValidatorKey().catch(() => this.wallet.publicKey);
+    const reqResult = await this.sdk.requestWithdrawalWithAction(
+      tokenMint,
+      new BN(amountRaw.toString()),
+      { commitFrequency: 300, validatorKey },
+      this.poolConfig,
+      true, // requestCustodySettlementWithAction — bundle settlement request inline
+    );
+    const requestSig = await this.sendL1Ixs(reqResult.instructions, reqResult.additionalSigners, 'magic.requestWithdraw');
+
+    const settleResult = await this.sdk.executeWithdrawalBaseChain(tokenMint, this.poolConfig, true);
+    const settleSig = await this.sendL1Ixs(settleResult.instructions, settleResult.additionalSigners, 'magic.executeWithdraw');
+
+    return { requestSig, settleSig };
+  }
+
   // ─── Inspection helpers ────────────────────────────────────────────────────
 
   async preflight(stableMint?: PublicKey): Promise<{

@@ -218,7 +218,21 @@ export const magicVerify: ToolDefinition = {
     ]);
     const positionCount = (basket as { positions?: unknown[] } | null)?.positions?.length ?? 0;
     const orderCount = (basket as { orders?: unknown[] } | null)?.orders?.length ?? 0;
-    const depositCount = (udl as { deposits?: unknown[] } | null)?.deposits?.length ?? 0;
+    const depositEntries = ((udl as { deposits?: Array<{ mint: PublicKey; amount: { toString(): string } }> } | null)
+      ?.deposits ?? []) as Array<{ mint: PublicKey; amount: { toString(): string } }>;
+    const depositCount = depositEntries.length;
+    // Resolve each entry's mint → token symbol/decimals from PoolConfig and
+    // sum into a USD-equivalent (stables only — non-stable balances reported raw).
+    const depositLines: string[] = [];
+    let totalDepositUsd = 0;
+    for (const e of depositEntries) {
+      const tok = client.poolConfig.custodies.find((c) => c.mintKey.equals(e.mint));
+      const sym = tok?.symbol ?? '?';
+      const decimals = tok?.decimals ?? 0;
+      const amt = Number(e.amount.toString()) / 10 ** decimals;
+      depositLines.push(`    ${sym.padEnd(10)} ${amt.toFixed(decimals === 6 ? 2 : 6)} ${sym}  (mint ${e.mint.toBase58().slice(0, 8)}…)`);
+      if (tok?.isStable) totalDepositUsd += amt;
+    }
 
     const lines = [
       `Verification — same accounts the Flash UI reads:`,
@@ -237,7 +251,9 @@ export const magicVerify: ToolDefinition = {
       ``,
       `  UDL PDA:        ${client.userDepositLedgerPda.toBase58()}`,
       `    on-chain:     ${udl ? '✓ exists' : '✗ NOT FOUND'}`,
-      `    deposits:     ${depositCount}`,
+      `    deposits:     ${depositCount} ${depositCount === 0 ? chalk.yellow('(VAULT EMPTY — run `magic deposit USDC <amount>` before trading)') : ''}`,
+      ...(depositLines.length > 0 ? depositLines : []),
+      ...(depositCount > 0 ? [`    total stable: ${formatUsd(totalDepositUsd)}`] : []),
       `    solscan:      ${solscanAcct(client.userDepositLedgerPda.toBase58(), client.network)}`,
       ``,
       `  Open in UI:     ${flashUiUrl()}    (connect wallet ${client.walletAddress.slice(0, 8)}…)`,
@@ -385,17 +401,115 @@ export const magicSetup: ToolDefinition = {
   },
 };
 
+/**
+ * Deposit tokens into the UserDepositLedger (vault) on L1.
+ * Accepts a symbol (USDC, SOL, etc.) OR a raw mint pubkey, and a human amount.
+ * Examples:
+ *   magic deposit USDC 50          → $50 USDC into vault
+ *   magic deposit SOL 0.1          → 0.1 SOL into vault
+ */
 export const magicDeposit: ToolDefinition = {
   name: 'magicDeposit',
-  description: 'Deposit collateral to the UserDepositLedger (L1). args: mint, amount (raw u64).',
-  parameters: z.object({ mint: z.string(), amount: z.string() }),
+  description: 'Deposit collateral to the vault (UDL on L1). args: symbol-or-mint, amount (human units).',
+  parameters: z.object({ token: z.string(), amount: z.number().positive() }),
   async execute(params, context): Promise<ToolResult> {
     const client = buildMagicClient(context);
-    const sig = await client.depositDirect(new PublicKey(params.mint as string), BigInt(params.amount as string));
+    const tokenArg = String(params.token);
+    const amountHuman = params.amount as number;
+
+    // Resolve symbol → mint via PoolConfig; fall back to treating tokenArg as a raw mint.
+    let mintPk: PublicKey;
+    let decimals: number;
+    let symbol: string;
+    const cust = client.poolConfig.custodies.find((c) => c.symbol === tokenArg.toUpperCase());
+    if (cust) {
+      mintPk = cust.mintKey;
+      decimals = cust.decimals;
+      symbol = cust.symbol;
+    } else {
+      try {
+        mintPk = new PublicKey(tokenArg);
+      } catch {
+        return { success: false, message: `Unknown token '${tokenArg}'. Use a symbol (USDC, SOL, BTC…) or a valid mint pubkey.` };
+      }
+      const resolved = client.poolConfig.custodies.find((c) => c.mintKey.equals(mintPk));
+      if (!resolved) {
+        return { success: false, message: `Mint ${mintPk.toBase58()} is not a custody in Pool.0. Run \`magic inspect\` to see supported tokens.` };
+      }
+      decimals = resolved.decimals;
+      symbol = resolved.symbol;
+    }
+
+    const amountRaw = BigInt(Math.floor(amountHuman * 10 ** decimals));
+    const sig = await client.depositDirect(mintPk, amountRaw);
     return {
       success: true,
-      message: `✓ Deposited ${params.amount} of ${params.mint}\n  tx: ${sig}`,
+      message: [
+        '',
+        chalk.green('  Deposit Complete'),
+        chalk.dim('  ─────────────────'),
+        `  Token:             ${chalk.cyan(symbol)}`,
+        `  Amount:            ${amountHuman} ${symbol}`,
+        `  Mint:              ${mintPk.toBase58()}`,
+        `  TX: ${chalk.dim(shortSig(sig))}  ${chalk.dim(solscanTx(sig, client.network))}`,
+        '',
+      ].join('\n'),
       txSignature: sig,
+    };
+  },
+};
+
+/**
+ * Withdraw tokens from the vault — 2-step process: queue request via the ER,
+ * then settle on L1. Bundled into one CLI command.
+ */
+export const magicWithdraw: ToolDefinition = {
+  name: 'magicWithdraw',
+  description: 'Withdraw from the vault. args: symbol-or-mint, amount (human units).',
+  parameters: z.object({ token: z.string(), amount: z.number().positive() }),
+  async execute(params, context): Promise<ToolResult> {
+    const client = buildMagicClient(context);
+    const tokenArg = String(params.token);
+    const amountHuman = params.amount as number;
+
+    let mintPk: PublicKey;
+    let decimals: number;
+    let symbol: string;
+    const cust = client.poolConfig.custodies.find((c) => c.symbol === tokenArg.toUpperCase());
+    if (cust) {
+      mintPk = cust.mintKey;
+      decimals = cust.decimals;
+      symbol = cust.symbol;
+    } else {
+      try {
+        mintPk = new PublicKey(tokenArg);
+      } catch {
+        return { success: false, message: `Unknown token '${tokenArg}'.` };
+      }
+      const resolved = client.poolConfig.custodies.find((c) => c.mintKey.equals(mintPk));
+      if (!resolved) {
+        return { success: false, message: `Mint ${mintPk.toBase58()} is not a custody in Pool.0.` };
+      }
+      decimals = resolved.decimals;
+      symbol = resolved.symbol;
+    }
+
+    const amountRaw = BigInt(Math.floor(amountHuman * 10 ** decimals));
+    const result = await client.withdraw(mintPk, amountRaw);
+    return {
+      success: true,
+      message: [
+        '',
+        chalk.green('  Withdrawal Complete'),
+        chalk.dim('  ─────────────────'),
+        `  Token:             ${chalk.cyan(symbol)}`,
+        `  Amount:            ${amountHuman} ${symbol}`,
+        `  Mint:              ${mintPk.toBase58()}`,
+        `  Request TX: ${chalk.dim(shortSig(result.requestSig))}  ${chalk.dim(solscanTx(result.requestSig, client.network))}`,
+        `  Settle  TX: ${chalk.dim(shortSig(result.settleSig))}  ${chalk.dim(solscanTx(result.settleSig, client.network))}`,
+        '',
+      ].join('\n'),
+      txSignature: result.settleSig,
     };
   },
 };
@@ -587,6 +701,7 @@ export const magicTools: ToolDefinition[] = [
   magicMarkets,
   magicSetup,
   magicDeposit,
+  magicWithdraw,
   magicOpen,
   magicClose,
   magicAddCollateral,

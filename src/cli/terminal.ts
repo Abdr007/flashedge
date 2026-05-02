@@ -2305,9 +2305,12 @@ export class FlashTerminal {
         console.log('');
         return;
       }
-      const raw = lower === 'magic' ? 'inspect' : lower.slice(6).trim();
+      // Use the original (case-preserving) input for arg extraction. Base58 mint
+      // pubkeys lose meaning if lowercased — `EPjFW…` ≠ `epjfw…`.
+      const trimmed = input.trim();
+      const raw = trimmed.toLowerCase() === 'magic' ? 'inspect' : trimmed.slice(6).trim();
       const parts = raw.split(/\s+/);
-      const sub = parts[0] ?? 'inspect';
+      const sub = (parts[0] ?? 'inspect').toLowerCase();
       const resolved = (() => {
         switch (sub) {
           case 'inspect':
@@ -2334,9 +2337,18 @@ export class FlashTerminal {
           case 'setup':
             return { tool: 'magicSetup', params: {} };
           case 'deposit': {
-            // magic deposit <mint> <amount>
-            if (parts.length < 3) return { error: 'usage: magic deposit <mint> <amount_u64>' };
-            return { tool: 'magicDeposit', params: { mint: parts[1], amount: parts[2] } };
+            // magic deposit <symbol-or-mint> <amount> (human units)
+            if (parts.length < 3) return { error: 'usage: magic deposit <symbol|mint> <amount>  (e.g. `magic deposit USDC 50`)' };
+            const amount = Number(parts[2]);
+            if (!Number.isFinite(amount) || amount <= 0) return { error: `amount must be a positive number (got '${parts[2]}')` };
+            return { tool: 'magicDeposit', params: { token: parts[1], amount } };
+          }
+          case 'withdraw': {
+            // magic withdraw <symbol-or-mint> <amount> (human units)
+            if (parts.length < 3) return { error: 'usage: magic withdraw <symbol|mint> <amount>  (e.g. `magic withdraw USDC 50`)' };
+            const amount = Number(parts[2]);
+            if (!Number.isFinite(amount) || amount <= 0) return { error: `amount must be a positive number (got '${parts[2]}')` };
+            return { tool: 'magicWithdraw', params: { token: parts[1], amount } };
           }
           case 'open': {
             // magic open <symbol> <long|short> <collateralUsd> <leverage> [collateralToken]
@@ -2418,7 +2430,8 @@ export class FlashTerminal {
           console.log(chalk.dim('    magic delegation                     — basket delegation status'));
           console.log(chalk.dim('    magic faucet                         — where to get devnet SOL + stable tokens'));
           console.log(chalk.dim('    magic setup                          — init UDL + basket + delegate (idempotent)'));
-          console.log(chalk.dim('    magic deposit <mint> <amount_u64>    — deposit collateral to UDL (L1)'));
+          console.log(chalk.dim('    magic deposit <symbol|mint> <amount>  — deposit to vault  (e.g. `magic deposit USDC 50`)'));
+          console.log(chalk.dim('    magic withdraw <symbol|mint> <amount> — withdraw from vault'));
           console.log(chalk.dim('    magic open <symbol> <long|short> <collateral_usd> <leverage> [collateralToken]'));
           console.log(chalk.dim('    magic close <symbol> <long|short> [receiveToken]'));
           console.log(chalk.dim('    magic add <symbol> <long|short> <amount_usd>      — add collateral'));
