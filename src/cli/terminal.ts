@@ -2340,6 +2340,24 @@ export class FlashTerminal {
 
     // Magic-mode commands — intercepted before FAST_DISPATCH since they're tri-mode
     // gated, not part of the general intent grammar.
+    //
+    // Auto-prefix: when the user is already in MAGIC mode, treat bare verbs
+    // (open/close/add/remove/vault/portfolio/...) as if they typed `magic` first.
+    // No `magic ` prefix needed in steady state — only when you want to use a
+    // magic command from another mode (which is gated below anyway).
+    const MAGIC_VERBS = new Set([
+      'open', 'close', 'add', 'add-collateral', 'remove', 'remove-collateral',
+      'deposit', 'withdraw', 'settle',
+      'vault', 'balance', 'portfolio', 'verify', 'parity',
+      'price', 'markets', 'status', 'inspect', 'delegation', 'delegated',
+      'setup', 'faucet',
+    ]);
+    const firstWord = lower.split(/\s+/)[0] ?? '';
+    if (this.config.tradingMode === 'magic' && MAGIC_VERBS.has(firstWord) && !lower.startsWith('magic ')) {
+      // Re-dispatch as `magic <input>` — recurse once with the prefix added.
+      return this.handleInput(`magic ${input.trim()}`);
+    }
+
     if (lower === 'magic' || lower.startsWith('magic ')) {
       if (this.config.tradingMode !== 'magic') {
         console.log('');
