@@ -287,6 +287,96 @@ close all                 # close all positions
 
 ---
 
+## Magic Trading (v2 — MagicBlock ER)
+
+Sub-second confirms via the Flash Trade Magic ER. Sign trades from your
+keypair file; positions update on the same on-chain accounts the
+official UI reads at https://app.flash.trade/.
+
+### Switching modes
+
+Pick mode 3 at startup, or set `TRADING_MODE=magic` in your env.
+Network defaults to mainnet-beta (Pool.0 on `FTv2…hrzV`); set
+`MAGIC_NETWORK=devnet` to use Pool.1.
+
+### Daily flow
+
+```bash
+flashedge                       # mode 3, your wallet
+
+vault                           # see what's in the vault per token
+deposit USDC 100                # fund the vault from your wallet
+open SOL long 10 2              # open SOL long, $10 collateral, 2x lev
+                                # → preview card, Y/N to confirm
+portfolio                       # live PnL + mark + liq per position
+close SOL long                  # close it, payout in USDC
+withdraw USDC 50                # pull back to your wallet
+```
+
+`magic ` prefix is optional in this mode — bare verbs auto-prefix.
+
+### Trading verbs
+
+| Command | Action |
+|---|---|
+| `open SOL long 10 2` | Open SOL long, $10 coll, 2x lev |
+| `close SOL long` | Full close |
+| `partial-close SOL long 5` | Close $5 of size, keep the rest |
+| `reverse SOL long 10 2` | Close + open opposite atomically |
+| `increase SOL long 10` | Add $10 of size at current price |
+| `add SOL long 25` | Add $25 collateral (lower leverage) |
+| `remove SOL long 10` | Remove $10 collateral (raise leverage) |
+| `tp SOL long 95` | Set Take-Profit at $95 |
+| `sl SOL long 80` | Set Stop-Loss at $80 |
+| `limit SOL long 80 10 2` | Limit order: open at $80, $10 coll, 2x |
+| `cancel-limit SOL long <id>` | Cancel a pending limit order |
+| `cancel-tp SOL <id>` / `cancel-sl SOL <id>` | Cancel TP/SL |
+| `liquidate <owner> SOL long` | Liquidate someone else's underwater position |
+
+### Inspect / status
+
+| Command | Action |
+|---|---|
+| `vault` | Vault balance per token (deposits / locked / available) |
+| `portfolio` | Open positions with live PnL/mark/liq |
+| `verify` | CLI ↔ UI parity check (basket + UDL PDAs + Solscan/Explorer links) |
+| `price SOL` | Current oracle price for a market |
+| `markets` | All 52 markets + leverage caps |
+| `status` | Wallet preflight (SOL, UDL, basket, deposits) |
+| `inspect` | Network + pool + program + custodies |
+| `history` | Recent magic trades (local journal at `~/.flash/magic-history.jsonl`) |
+| `dashboard` | At-a-glance: vault + positions + ER health + recent trades |
+| `er` | ER router health (latency, last error) |
+| `watch` | Live position table with 1s refresh (Enter to exit) |
+
+### UX
+
+- **Y/N preview** before every signed trade. Set `MAGIC_AUTO_CONFIRM=true` to skip.
+- **⚡ Latency display** after each command — green <0.5s, yellow <2s, red ≥2s. Timer measures only the post-confirm machine work; the time you spend reading the preview is not counted.
+- **Solana Explorer URLs** are copy/paste-safe (URL-encoded customUrl). Override to Solscan with `FLASH_EXPLORER=solscan`.
+- **Flexible parsing** — same parser as v1: `open sol long 2x $10`, `open 5x short btc $50`, `add 25 to SOL long` all work.
+
+### Safety
+
+Every magic-mode signing path runs through:
+- Program-ID whitelist (`validateInstructionPrograms`)
+- Trade caps + rate limit + audit log (`signing-guard.ts`)
+- Per-market trade mutex
+- Recent-tx signature dedupe (60s)
+- Owner keypair integrity check before each sign
+
+The program ID `FTv2RxXarPfNta45HTTMVaGvjzsGg27FXJ3hEKWBhrzV` (mainnet)
+and `FMTgsEDaPPfJi1PKD67McLTC5n833T4irbBP53LLxtvj` (devnet) are
+already in the base whitelist.
+
+### Performance
+
+- ER blockhash pre-warmer (400ms refresh) — saves a roundtrip per tx.
+- Quote cache between preview + open — skips a duplicate simulate after Y/N.
+- Auto-settle skipped on hot path (settle has ER-side delegation race issues; manual `settle` still available).
+
+---
+
 ## Testing
 
 ```bash

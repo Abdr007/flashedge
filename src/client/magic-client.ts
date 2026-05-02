@@ -1,3 +1,6 @@
+/* eslint-disable max-lines -- All magic-mode client logic lives here as a
+   single class for atomic state (basket pubkeys, blockhash cache, quote cache,
+   trade mutex). Splitting would scatter the SDK dependency across files. */
 /**
  * MagicTradeClient — wraps `@flash_trade/magic-trade-client` for FlashEdge.
  *
@@ -895,6 +898,113 @@ export class MagicTradeClient implements IFlashClient {
       } as unknown as Parameters<typeof this.sdk.placeTriggerOrder>[4],
     );
     const sig = await this.sendErIxs(result.instructions, result.additionalSigners, isStopLoss ? 'magic.sl' : 'magic.tp');
+    return { txSignature: sig };
+  }
+
+  /** Place a limit order. Fills automatically when oracle hits limitPriceUsd. */
+  async placeLimit(
+    market: string,
+    side: TradeSide,
+    limitPriceUsd: number,
+    collateralUsd: number,
+    leverage: number,
+    tpUsd?: number,
+    slUsd?: number,
+    collateralToken = 'USDC',
+  ): Promise<{ txSignature: string }> {
+    const targetSymbol = market.toUpperCase();
+    const sdkSide = side === TradeSide.Long ? Side.Long : Side.Short;
+    const { lockSymbol } = this.resolveMarket(targetSymbol, side);
+    const targetCustody = this.poolConfig.getCustodyFromSymbol(targetSymbol);
+    const colCustody = this.poolConfig.getCustodyFromSymbol(collateralToken.toUpperCase());
+
+    const collateralRaw = new BN(Math.floor(collateralUsd * 10 ** colCustody.decimals));
+    const sizeUsd = collateralUsd * leverage;
+    const sizeRaw = new BN(Math.floor((sizeUsd / limitPriceUsd) * 10 ** targetCustody.decimals));
+
+    const result = await this.sdk.placeLimitOrder(
+      targetSymbol,
+      lockSymbol,
+      sdkSide,
+      this.poolConfig,
+      {
+        limitPrice: usdToOraclePrice(limitPriceUsd),
+        collateralAmount: collateralRaw,
+        sizeAmount: sizeRaw,
+        takeProfitPrice: tpUsd ? usdToOraclePrice(tpUsd) : usdToOraclePrice(0),
+        stopLossPrice: slUsd ? usdToOraclePrice(slUsd) : usdToOraclePrice(0),
+      } as unknown as Parameters<typeof this.sdk.placeLimitOrder>[4],
+      collateralToken.toUpperCase(),
+    );
+    const sig = await this.sendErIxs(result.instructions, result.additionalSigners, 'magic.placeLimit');
+    return { txSignature: sig };
+  }
+
+  /** Cancel a limit order (sets limit_price and size_amount to 0 via edit). */
+  async cancelLimit(
+    market: string,
+    side: TradeSide,
+    orderId: number,
+    collateralToken = 'USDC',
+  ): Promise<{ txSignature: string }> {
+    const targetSymbol = market.toUpperCase();
+    const sdkSide = side === TradeSide.Long ? Side.Long : Side.Short;
+    const { lockSymbol } = this.resolveMarket(targetSymbol, side);
+    const result = await this.sdk.editLimitOrder(
+      targetSymbol,
+      lockSymbol,
+      sdkSide,
+      this.poolConfig,
+      {
+        orderId,
+        limitPrice: usdToOraclePrice(0),
+        sizeAmount: new BN(0),
+        stopLossPrice: usdToOraclePrice(0),
+        takeProfitPrice: usdToOraclePrice(0),
+      } as unknown as Parameters<typeof this.sdk.editLimitOrder>[4],
+      collateralToken.toUpperCase(),
+    );
+    const sig = await this.sendErIxs(result.instructions, result.additionalSigners, 'magic.cancelLimit');
+    return { txSignature: sig };
+  }
+
+  /** Cancel a TP/SL trigger order by id. */
+  async cancelTrigger(
+    market: string,
+    orderId: number,
+    isStopLoss: boolean,
+  ): Promise<{ txSignature: string }> {
+    const targetSymbol = market.toUpperCase();
+    const targetCustody = this.poolConfig.getCustodyFromSymbol(targetSymbol);
+    const marketAccount = this.poolConfig.markets.find((m) => m.targetCustody.equals(targetCustody.custodyAccount))?.marketAccount;
+    if (!marketAccount) throw new Error(`No market for ${targetSymbol}`);
+
+    const result = await this.sdk.cancelTriggerOrder(this.poolConfig, {
+      market: marketAccount,
+      orderId,
+      isStopLoss,
+    } as unknown as Parameters<typeof this.sdk.cancelTriggerOrder>[1]);
+    const sig = await this.sendErIxs(result.instructions, result.additionalSigners, 'magic.cancelTrigger');
+    return { txSignature: sig };
+  }
+
+  /** Liquidate someone else's underwater position. Earns liquidator fee. */
+  async liquidatePosition(
+    positionOwner: PublicKey,
+    market: string,
+    side: TradeSide,
+  ): Promise<{ txSignature: string }> {
+    const targetSymbol = market.toUpperCase();
+    const sdkSide = side === TradeSide.Long ? Side.Long : Side.Short;
+    const { lockSymbol } = this.resolveMarket(targetSymbol, side);
+    const result = await this.sdk.liquidatePosition(
+      positionOwner,
+      targetSymbol,
+      lockSymbol,
+      sdkSide,
+      this.poolConfig,
+    );
+    const sig = await this.sendErIxs(result.instructions, result.additionalSigners, 'magic.liquidate');
     return { txSignature: sig };
   }
 

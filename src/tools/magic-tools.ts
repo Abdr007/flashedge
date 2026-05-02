@@ -18,6 +18,8 @@ import { Connection, PublicKey } from '@solana/web3.js';
 import { ToolDefinition, ToolContext, ToolResult, TradeSide } from '../types/index.js';
 import { MagicTradeClient } from '../client/magic-client.js';
 import { formatPrice, formatUsd } from '../utils/format.js';
+import { readMagicHistory, recordMagicTrade } from '../security/magic-history.js';
+import { startErHealthMonitor, getErHealthMonitor } from '../monitor/magic-er-health.js';
 
 /** Truncate a long base58 string for display: "5oZL8a…m9KJ". */
 function shortSig(s: string): string {
@@ -869,6 +871,118 @@ export const magicIncrease: ToolDefinition = {
   },
 };
 
+export const magicPlaceLimit: ToolDefinition = {
+  name: 'magicPlaceLimit',
+  description: 'Place a limit order. args: market, side, limitPrice, collateral, leverage, tp?, sl?',
+  parameters: z.object({
+    market: z.string(),
+    side: z.enum(['long', 'short']),
+    limitPrice: z.number().positive(),
+    collateral: z.number().positive(),
+    leverage: z.number().positive(),
+    tp: z.number().positive().optional(),
+    sl: z.number().positive().optional(),
+  }),
+  async execute(params, context): Promise<ToolResult> {
+    const client = buildMagicClient(context);
+    const r = await client.placeLimit(
+      params.market as string,
+      params.side as TradeSide,
+      params.limitPrice as number,
+      params.collateral as number,
+      params.leverage as number,
+      params.tp as number | undefined,
+      params.sl as number | undefined,
+    );
+    return {
+      success: true,
+      message: [
+        '',
+        chalk.green('  Limit Order Placed'),
+        chalk.dim('  ─────────────────'),
+        `  Market:        ${chalk.cyan(String(params.market).toUpperCase())} ${chalk.bold(String(params.side))} ${chalk.dim(`${params.leverage}x`)}`,
+        `  Limit Price:   ${formatPrice(params.limitPrice as number)}`,
+        `  Collateral:    ${formatUsd(params.collateral as number)}`,
+        ...(params.tp ? [`  Take Profit:   ${formatPrice(params.tp as number)}`] : []),
+        ...(params.sl ? [`  Stop Loss:     ${formatPrice(params.sl as number)}`] : []),
+        `  TX: ${chalk.dim(shortSig(r.txSignature))}  ${chalk.dim(solscanTx(r.txSignature, client.network))}`,
+        '',
+      ].join('\n'),
+      txSignature: r.txSignature,
+    };
+  },
+};
+
+export const magicCancelLimit: ToolDefinition = {
+  name: 'magicCancelLimit',
+  description: 'Cancel a limit order. args: market, side, orderId.',
+  parameters: z.object({
+    market: z.string(),
+    side: z.enum(['long', 'short']),
+    orderId: z.number().int().nonnegative(),
+  }),
+  async execute(params, context): Promise<ToolResult> {
+    const client = buildMagicClient(context);
+    const r = await client.cancelLimit(params.market as string, params.side as TradeSide, params.orderId as number);
+    return {
+      success: true,
+      message: `✓ Cancelled limit order #${params.orderId}\n  TX: ${chalk.dim(shortSig(r.txSignature))}  ${chalk.dim(solscanTx(r.txSignature, client.network))}`,
+      txSignature: r.txSignature,
+    };
+  },
+};
+
+export const magicCancelTrigger: ToolDefinition = {
+  name: 'magicCancelTrigger',
+  description: 'Cancel a TP or SL trigger order. args: market, orderId, isStopLoss.',
+  parameters: z.object({
+    market: z.string(),
+    orderId: z.number().int().nonnegative(),
+    isStopLoss: z.boolean(),
+  }),
+  async execute(params, context): Promise<ToolResult> {
+    const client = buildMagicClient(context);
+    const r = await client.cancelTrigger(params.market as string, params.orderId as number, params.isStopLoss as boolean);
+    const label = params.isStopLoss ? 'stop-loss' : 'take-profit';
+    return {
+      success: true,
+      message: `✓ Cancelled ${label} #${params.orderId}\n  TX: ${chalk.dim(shortSig(r.txSignature))}  ${chalk.dim(solscanTx(r.txSignature, client.network))}`,
+      txSignature: r.txSignature,
+    };
+  },
+};
+
+export const magicLiquidate: ToolDefinition = {
+  name: 'magicLiquidate',
+  description: 'Liquidate an underwater position. args: positionOwner (pubkey), market, side.',
+  parameters: z.object({
+    positionOwner: z.string(),
+    market: z.string(),
+    side: z.enum(['long', 'short']),
+  }),
+  async execute(params, context): Promise<ToolResult> {
+    const client = buildMagicClient(context);
+    const r = await client.liquidatePosition(
+      new PublicKey(params.positionOwner as string),
+      params.market as string,
+      params.side as TradeSide,
+    );
+    return {
+      success: true,
+      message: [
+        '',
+        chalk.green('  Liquidation Sent'),
+        chalk.dim('  ─────────────────'),
+        `  Owner:    ${chalk.dim(String(params.positionOwner).slice(0, 8) + '…')}`,
+        `  Market:   ${chalk.cyan(String(params.market).toUpperCase())} ${chalk.bold(String(params.side))}`,
+        `  TX: ${chalk.dim(shortSig(r.txSignature))}  ${chalk.dim(solscanTx(r.txSignature, client.network))}`,
+        '',
+      ].join('\n'),
+      txSignature: r.txSignature,
+    };
+  },
+};
+
 export const magicTriggerOrder: ToolDefinition = {
   name: 'magicTriggerOrder',
   description: 'Place TP or SL on a position. args: market, side, price, isStopLoss, sizeUsd?',
@@ -946,6 +1060,151 @@ export const magicSettle: ToolDefinition = {
   },
 };
 
+export const magicHistory: ToolDefinition = {
+  name: 'magicHistory',
+  description: 'Show recent magic-mode trade history (local journal).',
+  parameters: z.object({ limit: z.number().int().positive().optional() }),
+  async execute(params, context): Promise<ToolResult> {
+    const kp = context.walletManager.getKeypair();
+    const wallet = kp?.publicKey.toBase58();
+    const limit = (params.limit as number | undefined) ?? 20;
+    const entries = readMagicHistory(limit, wallet);
+    if (entries.length === 0) {
+      return { success: true, message: chalk.dim('  no magic trades recorded yet') };
+    }
+    const lines = ['', chalk.cyan('  📜 Magic History'), chalk.dim('  ─────────────────────────────────────')];
+    for (const e of entries) {
+      const t = new Date(e.ts).toLocaleString();
+      const sym = e.market ? chalk.bold(e.market) : '';
+      const sd = e.side ? (e.side === 'short' ? chalk.red(e.side) : chalk.green(e.side)) : '';
+      const detail =
+        e.collateralUsd !== undefined
+          ? ` $${e.collateralUsd}${e.leverage ? ` ${e.leverage}x` : ''}`
+          : e.sizeUsd !== undefined
+            ? ` $${e.sizeUsd}`
+            : e.triggerPriceUsd !== undefined
+              ? ` @ $${e.triggerPriceUsd}`
+              : '';
+      lines.push(`  ${chalk.dim(t.padEnd(22))}${e.type.padEnd(16)}${sym} ${sd}${detail}  ${chalk.dim(e.txSignature.slice(0, 8) + '…')}`);
+    }
+    lines.push('');
+    return { success: true, message: lines.join('\n'), data: { entries } };
+  },
+};
+
+export const magicDashboard: ToolDefinition = {
+  name: 'magicDashboard',
+  description: 'At-a-glance: vault, positions, ER health, recent trades.',
+  async execute(_params, context): Promise<ToolResult> {
+    const client = buildMagicClient(context);
+    const er = startErHealthMonitor(client['erEndpoint'] ?? 'https://flashtrade.magicblock.app/');
+    void er; // ensure it's running
+    const [balances, portfolio] = await Promise.all([
+      client.getAvailableBalances(),
+      client.getPortfolio(),
+    ]);
+    const recent = readMagicHistory(5, context.walletManager.getKeypair()?.publicKey.toBase58());
+    const health = getErHealthMonitor()?.snapshot();
+    const sep = chalk.dim('  ─────────────────────────────────────');
+    const lines: string[] = [];
+    lines.push('', chalk.cyan('  ⚡ Magic Dashboard'), sep);
+
+    // Vault summary
+    let stableUsd = 0;
+    for (const [sym, b] of balances) {
+      if (client.poolConfig.tokens.find((t) => t.symbol === sym)?.isStable) stableUsd += b.available;
+    }
+    lines.push(`  ${chalk.dim('Vault')}            available stable ${chalk.bold(formatUsd(stableUsd))}`);
+    lines.push(`  ${chalk.dim('Wallet')}           ${chalk.dim(client.walletAddress.slice(0, 8) + '…')}`);
+
+    // Positions summary
+    lines.push('');
+    lines.push(`  ${chalk.dim('Positions')}        ${portfolio.positions.length}`);
+    for (const p of portfolio.positions) {
+      const pnlColor = p.unrealizedPnl >= 0 ? chalk.green : chalk.red;
+      lines.push(
+        `    ${chalk.bold(p.market.padEnd(8))} ${p.side === 'short' ? chalk.red(p.side.padEnd(5)) : chalk.green(p.side.padEnd(5))} ${p.leverage.toFixed(1)}x  size ${formatUsd(p.sizeUsd)}  pnl ${pnlColor(formatUsd(p.unrealizedPnl))}`,
+      );
+    }
+
+    // ER health
+    lines.push('');
+    if (health) {
+      const dot = health.healthy ? chalk.green('●') : chalk.red('●');
+      lines.push(`  ${chalk.dim('ER status')}        ${dot} ${health.healthy ? 'healthy' : 'degraded'}  ${chalk.dim(`${health.lastRttMs}ms`)}${health.consecutiveFailures > 0 ? chalk.red(`  ${health.consecutiveFailures} consecutive failures`) : ''}`);
+    } else {
+      lines.push(`  ${chalk.dim('ER status')}        ${chalk.dim('probe not started yet')}`);
+    }
+
+    // Recent trades
+    if (recent.length > 0) {
+      lines.push('');
+      lines.push(`  ${chalk.dim('Recent')}`);
+      for (const e of recent) {
+        const t = new Date(e.ts).toLocaleTimeString();
+        lines.push(`    ${chalk.dim(t.padEnd(10))} ${e.type.padEnd(14)} ${e.market ?? ''}`);
+      }
+    }
+    lines.push('');
+    return { success: true, message: lines.join('\n'), data: { stableUsd, positions: portfolio.positions, health } };
+  },
+};
+
+export const magicErHealth: ToolDefinition = {
+  name: 'magicErHealth',
+  description: 'Show ER router health (latency, last error, consecutive failures).',
+  async execute(_params, context): Promise<ToolResult> {
+    const client = buildMagicClient(context);
+    const mon = startErHealthMonitor(client['erEndpoint'] ?? 'https://flashtrade.magicblock.app/');
+    // Wait for first tick (up to 2s) so we don't show empty stats.
+    if (mon.snapshot().lastCheckAt === 0) await new Promise((r) => setTimeout(r, 1500));
+    const s = mon.snapshot();
+    const sep = chalk.dim('  ─────────────────────────────────────');
+    const dot = s.healthy ? chalk.green('●') : chalk.red('●');
+    return {
+      success: true,
+      message: [
+        '',
+        chalk.cyan('  📡 ER Health'),
+        sep,
+        `  Endpoint:        ${s.endpoint}`,
+        `  Status:          ${dot} ${s.healthy ? chalk.green('healthy') : chalk.red('degraded')}`,
+        `  Last RTT:        ${s.lastRttMs}ms`,
+        `  Last block:      ${s.lastBlockHeight}`,
+        `  Last check:      ${s.lastCheckAt ? new Date(s.lastCheckAt).toLocaleTimeString() : 'pending'}`,
+        ...(s.lastErr ? [`  Last error:      ${chalk.red(s.lastErr)}`] : []),
+        ...(s.consecutiveFailures > 0 ? [`  Failures:        ${chalk.red(String(s.consecutiveFailures))} consecutive`] : []),
+        '',
+      ].join('\n'),
+      data: { ...s } as Record<string, unknown>,
+    };
+  },
+};
+
+/** Helper used by other magic tools to journal trades. */
+export function journalMagicTrade(
+  context: ToolContext,
+  type: import('../security/magic-history.js').MagicTradeEntry['type'],
+  details: Partial<import('../security/magic-history.js').MagicTradeEntry>,
+): void {
+  const kp = context.walletManager.getKeypair();
+  const network = (context.config?.magicNetwork ?? 'mainnet-beta') as 'mainnet-beta' | 'devnet';
+  if (!kp || !details.txSignature) return;
+  recordMagicTrade({
+    ts: new Date().toISOString(),
+    type,
+    walletAddress: kp.publicKey.toBase58(),
+    network,
+    txSignature: details.txSignature,
+    market: details.market,
+    side: details.side,
+    collateralUsd: details.collateralUsd,
+    sizeUsd: details.sizeUsd,
+    leverage: details.leverage,
+    triggerPriceUsd: details.triggerPriceUsd,
+  });
+}
+
 export const magicTools: ToolDefinition[] = [
   magicVault,
   magicSettle,
@@ -967,5 +1226,12 @@ export const magicTools: ToolDefinition[] = [
   magicPartialClose,
   magicIncrease,
   magicTriggerOrder,
+  magicPlaceLimit,
+  magicCancelLimit,
+  magicCancelTrigger,
+  magicLiquidate,
+  magicHistory,
+  magicDashboard,
+  magicErHealth,
   magicFaucet,
 ];

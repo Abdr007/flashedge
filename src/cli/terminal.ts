@@ -1335,6 +1335,8 @@ export class FlashTerminal {
       console.log(`    ${theme.command('remove SOL long 10')}            Remove $10 collateral from SOL long`);
       console.log(`    ${theme.command('tp SOL long 95')}                Set Take-Profit at $95`);
       console.log(`    ${theme.command('sl SOL long 80')}                Set Stop-Loss at $80`);
+      console.log(`    ${theme.command('limit SOL long 80 10 2')}        Limit order: open at $80, $10 coll, 2x`);
+      console.log(`    ${theme.command('liquidate <owner> SOL long')}    Liquidate someone else's underwater position`);
       console.log('');
       console.log(`  ${theme.dim('Vault')}`);
       console.log(`    ${theme.command('magic vault')}                  How much money is in your vault`);
@@ -1352,6 +1354,10 @@ export class FlashTerminal {
       console.log(`    ${theme.command('magic status')}                  Wallet preflight (SOL, UDL, basket)`);
       console.log(`    ${theme.command('magic inspect')}                 Network + pool + program + custodies`);
       console.log(`    ${theme.command('magic delegation')}              Basket delegation status`);
+      console.log(`    ${theme.command('watch')}                         Live position table (1s refresh)`);
+      console.log(`    ${theme.command('dashboard')}                     Vault + positions + ER health snapshot`);
+      console.log(`    ${theme.command('history')}                       Recent magic trades (local journal)`);
+      console.log(`    ${theme.command('er')}                            ER router health (latency, errors)`);
       console.log('');
       console.log(`  ${theme.dim('General')}`);
       console.log(`    ${theme.command('help')}                          Full command list (all categories)`);
@@ -2354,6 +2360,9 @@ export class FlashTerminal {
       'open', 'close', 'add', 'add-collateral', 'remove', 'remove-collateral',
       'reverse', 'flip', 'increase', 'inc', 'partial-close', 'decrease', 'dec',
       'tp', 'sl', 'take-profit', 'stop-loss',
+      'limit', 'cancel-limit', 'cancel-tp', 'cancel-sl', 'liquidate',
+      'history', 'journal', 'dashboard', 'dash', 'watch',
+      'er', 'er-health', 'health',
       'deposit', 'withdraw', 'settle',
       'vault', 'balance', 'portfolio', 'verify', 'parity',
       'price', 'markets', 'status', 'inspect', 'delegation', 'delegated',
@@ -2495,6 +2504,59 @@ export class FlashTerminal {
             if (!Number.isFinite(sizeUsd) || sizeUsd <= 0) return { error: `size must be a positive number (got '${parts[3]}')` };
             return { tool: 'magicPartialClose', params: { market: parts[1], side, sizeUsd } };
           }
+          case 'limit': {
+            // magic limit <symbol> <long|short> <limitPrice> <collateral> <leverage> [tp] [sl]
+            if (parts.length < 6) return { error: 'usage: magic limit <symbol> <long|short> <limit_price> <collateral> <leverage> [tp] [sl]' };
+            const side = parts[2];
+            if (side !== 'long' && side !== 'short') return { error: 'side must be long/short' };
+            const lim = Number(String(parts[3]).replace(/[$,]/g, ''));
+            const col = Number(String(parts[4]).replace(/[$,]/g, ''));
+            const lev = Number(String(parts[5]).replace(/x$/i, ''));
+            const tp = parts[6] ? Number(String(parts[6]).replace(/[$,]/g, '')) : undefined;
+            const sl = parts[7] ? Number(String(parts[7]).replace(/[$,]/g, '')) : undefined;
+            if (![lim, col, lev].every((n) => Number.isFinite(n) && n > 0)) return { error: 'limit/collateral/leverage must be positive numbers' };
+            return { tool: 'magicPlaceLimit', params: { market: parts[1], side, limitPrice: lim, collateral: col, leverage: lev, ...(tp ? { tp } : {}), ...(sl ? { sl } : {}) } };
+          }
+          case 'cancel-limit': {
+            // magic cancel-limit <symbol> <long|short> <orderId>
+            if (parts.length < 4) return { error: 'usage: magic cancel-limit <symbol> <long|short> <orderId>' };
+            const side = parts[2];
+            if (side !== 'long' && side !== 'short') return { error: 'side must be long/short' };
+            const id = parseInt(parts[3], 10);
+            if (!Number.isFinite(id) || id < 0) return { error: 'orderId must be a non-negative integer' };
+            return { tool: 'magicCancelLimit', params: { market: parts[1], side, orderId: id } };
+          }
+          case 'cancel-tp':
+          case 'cancel-sl': {
+            // magic cancel-tp <symbol> <orderId>  /  magic cancel-sl <symbol> <orderId>
+            if (parts.length < 3) return { error: `usage: magic ${parts[0]} <symbol> <orderId>` };
+            const id = parseInt(parts[2], 10);
+            if (!Number.isFinite(id) || id < 0) return { error: 'orderId must be a non-negative integer' };
+            return { tool: 'magicCancelTrigger', params: { market: parts[1], orderId: id, isStopLoss: parts[0] === 'cancel-sl' } };
+          }
+          case 'liquidate': {
+            // magic liquidate <ownerPubkey> <symbol> <long|short>
+            if (parts.length < 4) return { error: 'usage: magic liquidate <owner_pubkey> <symbol> <long|short>' };
+            const side = parts[3];
+            if (side !== 'long' && side !== 'short') return { error: 'side must be long/short' };
+            return { tool: 'magicLiquidate', params: { positionOwner: parts[1], market: parts[2], side } };
+          }
+          case 'history':
+          case 'journal': {
+            const limit = parts[1] ? parseInt(parts[1], 10) : 20;
+            return { tool: 'magicHistory', params: Number.isFinite(limit) ? { limit } : {} };
+          }
+          case 'dashboard':
+          case 'dash':
+            return { tool: 'magicDashboard', params: {} };
+          case 'er':
+          case 'er-health':
+          case 'health':
+            return { tool: 'magicErHealth', params: {} };
+          case 'watch': {
+            // magic watch — handled inline (TUI loop), not as a tool
+            return { tool: '__magicWatch', params: {} };
+          }
           case 'reverse':
           case 'flip': {
             // magic reverse <symbol> <currentSide> <collateral> <leverage>
@@ -2617,6 +2679,12 @@ export class FlashTerminal {
         // Reset latency clock — the ⚡ timer should show the sign+confirm time only,
         // not the seconds the user spent reading the preview and typing y.
         this.cmdStartOverride = Date.now();
+      }
+
+      // Watch loop is a TUI mode, not a one-shot tool — handle inline.
+      if (resolved.tool === '__magicWatch') {
+        await this.runMagicWatch();
+        return;
       }
 
       try {
@@ -3576,6 +3644,83 @@ export class FlashTerminal {
 
   // [L-11] Confirmation timeout — cancel trade if user doesn't respond within 2 minutes
   private static readonly CONFIRM_TIMEOUT_MS = 120_000;
+
+  /**
+   * Live magic-mode portfolio loop. Refreshes every 1s with cursor-home
+   * redraw so the table stays put. Press Enter or any key to exit.
+   */
+  private async runMagicWatch(): Promise<void> {
+    const { Connection } = await import('@solana/web3.js');
+    const { MagicTradeClient } = await import('../client/magic-client.js');
+    const { startErHealthMonitor, getErHealthMonitor } = await import('../monitor/magic-er-health.js');
+    const kp = this.walletManager?.getKeypair();
+    if (!kp) {
+      console.log(chalk.yellow('  Wallet required for watch mode.'));
+      return;
+    }
+    const network = this.config?.magicNetwork ?? 'mainnet-beta';
+    const poolName = this.config?.magicPoolName ?? (network === 'mainnet-beta' ? 'Pool.0' : 'Pool.1');
+    const erEndpoint = this.config?.magicRpcUrl ?? 'https://flashtrade.magicblock.app/';
+    const l1Url = this.config?.magicL1RpcUrl ?? (network === 'mainnet-beta' ? 'https://api.mainnet-beta.solana.com' : 'https://api.devnet.solana.com');
+    const client = new MagicTradeClient({
+      wallet: kp,
+      l1Connection: new Connection(l1Url, 'confirmed'),
+      network,
+      poolName,
+      erEndpoint,
+      programIdOverride: this.config?.magicProgramId,
+      fastConfirm: this.config?.magicFastConfirm ?? true,
+    });
+    startErHealthMonitor(erEndpoint);
+
+    let stop = false;
+    const onKey = () => {
+      stop = true;
+    };
+    process.stdin.once('data', onKey);
+
+    process.stdout.write('\x1b[2J\x1b[H'); // clear + home
+    console.log(chalk.cyan('  ⚡ Magic Watch'), chalk.dim('— press Enter to exit'));
+
+    while (!stop) {
+      try {
+        const portfolio = await client.getPortfolio();
+        const health = getErHealthMonitor()?.snapshot();
+        const dot = health?.healthy ? chalk.green('●') : chalk.red('●');
+        const lines: string[] = [];
+        lines.push('\x1b[3;1H\x1b[J'); // home(row 3) + erase below
+        lines.push(`  Wallet: ${chalk.dim(client.walletAddress.slice(0, 8) + '…')}   Vault: ${formatUsd(portfolio.balance)}   ${dot} ${health?.healthy ? 'ER ok' : 'ER degraded'} ${health ? chalk.dim(`(${health.lastRttMs}ms)`) : ''}`);
+        lines.push(chalk.dim('  ─────────────────────────────────────────────────────────────'));
+        if (portfolio.positions.length === 0) {
+          lines.push(chalk.dim('  no open positions'));
+        } else {
+          lines.push(`  ${chalk.dim('Market'.padEnd(8))}${chalk.dim('Side'.padEnd(6))}${chalk.dim('Lev'.padEnd(7))}${chalk.dim('Size'.padEnd(11))}${chalk.dim('Mark'.padEnd(13))}${chalk.dim('PnL'.padEnd(11))}${chalk.dim('Liq')}`);
+          for (const p of portfolio.positions) {
+            const pnlColor = p.unrealizedPnl >= 0 ? chalk.green : chalk.red;
+            const sideColor = p.side === 'short' ? chalk.red : chalk.green;
+            lines.push(
+              '  ' +
+                chalk.bold(p.market.padEnd(8)) +
+                sideColor(String(p.side).padEnd(6)) +
+                `${p.leverage.toFixed(1)}x`.padEnd(7) +
+                formatUsd(p.sizeUsd).padEnd(11) +
+                formatPrice(p.markPrice).padEnd(13) +
+                pnlColor(formatUsd(p.unrealizedPnl).padEnd(11)) +
+                (p.liquidationPrice ? chalk.yellow(formatPrice(p.liquidationPrice)) : chalk.dim('—')),
+            );
+          }
+        }
+        lines.push('');
+        lines.push(chalk.dim(`  refreshed ${new Date().toLocaleTimeString()} — Enter to exit`));
+        process.stdout.write(lines.join('\n') + '\n');
+      } catch (err) {
+        console.log(chalk.red(`  watch error: ${(err as Error).message}`));
+      }
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+    process.stdin.removeListener('data', onKey);
+    console.log(chalk.dim('\n  watch stopped'));
+  }
 
   /**
    * Build a preview card for magic open/close/add/remove/withdraw before signing.
