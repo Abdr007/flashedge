@@ -23,6 +23,25 @@ import { loadSession, saveSession, clearSession, listSessions } from '../securit
 const USDC_MINT_MAINNET = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 const USDC_MINT_DEVNET = 'Gh9ZwEmdLJ8DscKNTkTqPbNwLNNBjuSzaG9Vp2KGtKJr';
 
+/** Build a Solscan tx URL with cluster query for devnet. */
+function solscanTx(sig: string, network: 'mainnet-beta' | 'devnet'): string {
+  return network === 'devnet'
+    ? `https://solscan.io/tx/${sig}?cluster=devnet`
+    : `https://solscan.io/tx/${sig}`;
+}
+
+/** Build a Solscan account URL. */
+function solscanAcct(addr: string, network: 'mainnet-beta' | 'devnet'): string {
+  return network === 'devnet'
+    ? `https://solscan.io/account/${addr}?cluster=devnet`
+    : `https://solscan.io/account/${addr}`;
+}
+
+/** Flash UI URL — opens in the user's connected-wallet view. */
+function flashUiUrl(): string {
+  return 'https://app.flash.trade/';
+}
+
 /** Resolve the stable mint for the active network. */
 function stableMintFor(network: 'mainnet-beta' | 'devnet'): string {
   return network === 'mainnet-beta' ? USDC_MINT_MAINNET : USDC_MINT_DEVNET;
@@ -157,6 +176,8 @@ export const magicPortfolio: ToolDefinition = {
     const portfolio = await client.getPortfolio();
     const lines = [
       `wallet:        ${portfolio.walletAddress}`,
+      `basket:        ${client.basketPda.toBase58()}`,
+      `  → solscan:   ${solscanAcct(client.basketPda.toBase58(), client.network)}`,
       `balance:       ${portfolio.balance.toFixed(2)} ${portfolio.balanceLabel}`,
       `collateral:    $${portfolio.totalCollateralUsd.toFixed(2)}`,
       `unrealized:    $${portfolio.totalUnrealizedPnl.toFixed(2)}`,
@@ -168,14 +189,74 @@ export const magicPortfolio: ToolDefinition = {
         lines.push(
           `  ${p.market.padEnd(8)} ${p.side.padEnd(5)} ${p.leverage.toFixed(1)}x ` +
             `size=$${p.sizeUsd.toFixed(2)} entry=$${p.entryPrice.toFixed(4)} mark=$${p.markPrice.toFixed(4)} ` +
-            `pnl=$${p.unrealizedPnl.toFixed(2)}`,
+            `pnl=$${p.unrealizedPnl.toFixed(2)} liq=$${p.liquidationPrice.toFixed(4)}`,
         );
+        lines.push(`    market: ${p.pubkey}  → ${solscanAcct(p.pubkey, client.network)}`);
       });
+      lines.push('');
+      lines.push(`UI: ${flashUiUrl()}  (connect ${portfolio.walletAddress.slice(0, 8)}… to see same positions)`);
     }
     return {
       success: true,
       message: lines.join('\n'),
-      data: { portfolio },
+      data: { portfolio, basketPda: client.basketPda.toBase58() },
+    };
+  },
+};
+
+/**
+ * Read the on-chain basket directly and verify it matches what the UI sees.
+ * Useful when the user wants to confirm CLI/UI parity.
+ */
+export const magicVerify: ToolDefinition = {
+  name: 'magicVerify',
+  description: 'Verify on-chain state matches what the Flash UI sees (basket, positions, deposits).',
+  async execute(_params, context): Promise<ToolResult> {
+    const client = buildMagicClient(context);
+    const [basket, udl, delegation] = await Promise.all([
+      client.fetchBasket(),
+      client.fetchUserDepositLedger(),
+      client.getDelegationStatus(),
+    ]);
+    const positionCount = (basket as { positions?: unknown[] } | null)?.positions?.length ?? 0;
+    const orderCount = (basket as { orders?: unknown[] } | null)?.orders?.length ?? 0;
+    const depositCount = (udl as { deposits?: unknown[] } | null)?.deposits?.length ?? 0;
+
+    const lines = [
+      `Verification — same accounts the Flash UI reads:`,
+      ``,
+      `  Network:        ${client.network}`,
+      `  Pool:           ${client.poolConfig.poolName} (${client.poolConfig.poolAddress.toBase58()})`,
+      `  Program:        ${client.programId.toBase58()}`,
+      `  Wallet:         ${client.walletAddress}`,
+      ``,
+      `  Basket PDA:     ${client.basketPda.toBase58()}`,
+      `    on-chain:     ${basket ? '✓ exists' : '✗ NOT FOUND — UI will show no positions'}`,
+      `    delegated:    ${delegation.basketDelegated ? '✓ to ER (UI must read flashtrade.magicblock.app)' : '✗ on L1'}`,
+      `    positions:    ${positionCount}`,
+      `    orders:       ${orderCount}`,
+      `    solscan:      ${solscanAcct(client.basketPda.toBase58(), client.network)}`,
+      ``,
+      `  UDL PDA:        ${client.userDepositLedgerPda.toBase58()}`,
+      `    on-chain:     ${udl ? '✓ exists' : '✗ NOT FOUND'}`,
+      `    deposits:     ${depositCount}`,
+      `    solscan:      ${solscanAcct(client.userDepositLedgerPda.toBase58(), client.network)}`,
+      ``,
+      `  Open in UI:     ${flashUiUrl()}    (connect wallet ${client.walletAddress.slice(0, 8)}…)`,
+      ``,
+      `Every CLI trade writes to these accounts. Anything you see here is what the UI sees.`,
+    ];
+    return {
+      success: true,
+      message: lines.join('\n'),
+      data: {
+        basketPda: client.basketPda.toBase58(),
+        udlPda: client.userDepositLedgerPda.toBase58(),
+        positionCount,
+        orderCount,
+        depositCount,
+        delegated: delegation.basketDelegated,
+      },
     };
   },
 };
@@ -354,7 +435,9 @@ export const magicOpen: ToolDefinition = {
       message:
         `✓ Opened ${params.market} ${params.side} ${params.leverage}x  $${params.collateral} collateral\n` +
         `  entry: $${result.entryPrice.toFixed(4)}  liq: $${result.liquidationPrice.toFixed(4)}  size: $${result.sizeUsd.toFixed(2)}\n` +
-        `  tx: ${result.txSignature}`,
+        `  tx:      ${result.txSignature}\n` +
+        `  solscan: ${solscanTx(result.txSignature, client.network)}\n` +
+        `  ui:      ${flashUiUrl()}    (connect wallet ${client.walletAddress.slice(0, 8)}…)`,
       txSignature: result.txSignature,
       data: { result },
     };
@@ -378,7 +461,11 @@ export const magicClose: ToolDefinition = {
     );
     return {
       success: true,
-      message: `✓ Closed ${params.market} ${params.side}\n  pnl: $${result.pnl.toFixed(2)}  tx: ${result.txSignature}`,
+      message:
+        `✓ Closed ${params.market} ${params.side}\n` +
+        `  pnl:     $${result.pnl.toFixed(2)}\n` +
+        `  tx:      ${result.txSignature}\n` +
+        `  solscan: ${solscanTx(result.txSignature, client.network)}`,
       txSignature: result.txSignature,
       data: { result },
     };
@@ -398,7 +485,10 @@ export const magicAddCollateral: ToolDefinition = {
     const result = await client.addCollateral(params.market as string, params.side as TradeSide, params.amount as number);
     return {
       success: true,
-      message: `✓ Added $${params.amount} collateral to ${params.market} ${params.side}\n  tx: ${result.txSignature}`,
+      message:
+        `✓ Added $${params.amount} collateral to ${params.market} ${params.side}\n` +
+        `  tx:      ${result.txSignature}\n` +
+        `  solscan: ${solscanTx(result.txSignature, client.network)}`,
       txSignature: result.txSignature,
     };
   },
@@ -421,7 +511,10 @@ export const magicRemoveCollateral: ToolDefinition = {
     );
     return {
       success: true,
-      message: `✓ Removed $${params.amount} collateral from ${params.market} ${params.side}\n  tx: ${result.txSignature}`,
+      message:
+        `✓ Removed $${params.amount} collateral from ${params.market} ${params.side}\n` +
+        `  tx:      ${result.txSignature}\n` +
+        `  solscan: ${solscanTx(result.txSignature, client.network)}`,
       txSignature: result.txSignature,
     };
   },
@@ -559,6 +652,7 @@ export const magicTools: ToolDefinition[] = [
   magicStatus,
   magicDelegation,
   magicPortfolio,
+  magicVerify,
   magicMarkets,
   magicSetup,
   magicDeposit,

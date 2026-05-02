@@ -2315,6 +2315,9 @@ export class FlashTerminal {
             return { tool: 'magicInspect', params: {} };
           case 'portfolio':
             return { tool: 'magicPortfolio', params: {} };
+          case 'verify':
+          case 'parity':
+            return { tool: 'magicVerify', params: {} };
           case 'markets':
             return { tool: 'magicMarkets', params: {} };
           case 'delegation':
@@ -2413,6 +2416,7 @@ export class FlashTerminal {
           console.log(chalk.dim('    magic inspect                        — enumerate pools/markets/custodies'));
           console.log(chalk.dim('    magic status                         — wallet preflight (SOL, UDL, basket)'));
           console.log(chalk.dim('    magic portfolio                      — your positions + balance'));
+          console.log(chalk.dim('    magic verify                         — confirm CLI/UI parity (same on-chain accounts)'));
           console.log(chalk.dim('    magic markets                        — list Market pubkeys'));
           console.log(chalk.dim('    magic delegation                     — basket delegation status'));
           console.log(chalk.dim('    magic faucet                         — where to get devnet SOL + stable tokens'));
