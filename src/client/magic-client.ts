@@ -397,6 +397,26 @@ export class MagicTradeClient implements IFlashClient {
         return { txSignature: cached, entryPrice: 0, liquidationPrice: 0, sizeUsd };
       }
 
+      // Auto-settle: closed positions deposit their payout into `pendingCredits`,
+      // not back into `deposits`. The program checks `available = deposits −
+      // debits + pendingCredits` so pendingCredits count technically, but only
+      // when matched 1:1 with debits. We pre-settle the collateral custody
+      // whenever the user holds non-zero pendingCredits — turns close-then-
+      // reopen into a clean flow.
+      const balances = await this.getAvailableBalances();
+      const collBal = balances.get(collateralSymbol);
+      if (collBal && collBal.pendingCredits > 0 && collBal.available < collateralAmount * 1.01) {
+        log.info(
+          'magic-client',
+          `auto-settling ${collateralSymbol}: available=${collBal.available.toFixed(4)} pendingCredits=${collBal.pendingCredits.toFixed(4)} required≈${(collateralAmount * 1.01).toFixed(4)}`,
+        );
+        try {
+          await this.settleCustody(collateralSymbol);
+        } catch (err) {
+          log.warn('magic-client', `settle ${collateralSymbol} failed: ${(err as Error).message} — proceeding anyway`);
+        }
+      }
+
       const collateralCustody = this.poolConfig.getCustodyFromSymbol(collateralSymbol);
       const collateralRaw = new BN(Math.floor(collateralAmount * 10 ** collateralCustody.decimals));
       const leverageBps = new BN(Math.round(leverage * 10_000));
@@ -652,6 +672,73 @@ export class MagicTradeClient implements IFlashClient {
   async depositDirect(tokenMint: PublicKey, amountRaw: bigint): Promise<string> {
     const result = await this.sdk.depositDirect(tokenMint, new BN(amountRaw.toString()));
     return this.sendL1Ixs(result.instructions, result.additionalSigners, 'magic.depositDirect');
+  }
+
+  /**
+   * Settle a custody's pending credits/debits — moves matched entries off the
+   * basket and into the UDL deposit balance. Without this, a closed position's
+   * payout sits in `pendingCredits` and isn't usable for new trades. Returns
+   * the L1 signature.
+   */
+  async settleCustody(custodySymbol: string): Promise<string> {
+    const result = await this.sdk.processCustodySettlementEr(custodySymbol, this.poolConfig);
+    return this.sendL1Ixs(result.instructions, result.additionalSigners, `magic.settle.${custodySymbol}`);
+  }
+
+  /**
+   * Settle all custodies that currently have pending credits/debits in the
+   * user's basket. Returns one signature per settled custody.
+   */
+  async settleAll(): Promise<Array<{ symbol: string; sig: string | null; err?: string }>> {
+    const basket = (await this.sdk.accounts.fetchBasket(this.wallet.publicKey).catch(() => null)) as
+      | { debits?: Array<{ mint: PublicKey; amount: BN }>; pendingCredits?: Array<{ mint: PublicKey; amount: BN }> }
+      | null;
+    const symbols = new Set<string>();
+    for (const e of basket?.debits ?? []) {
+      const sym = this.poolConfig.custodies.find((c) => c.mintKey.equals(e.mint))?.symbol;
+      if (sym) symbols.add(sym);
+    }
+    for (const e of basket?.pendingCredits ?? []) {
+      const sym = this.poolConfig.custodies.find((c) => c.mintKey.equals(e.mint))?.symbol;
+      if (sym) symbols.add(sym);
+    }
+    const out: Array<{ symbol: string; sig: string | null; err?: string }> = [];
+    for (const sym of symbols) {
+      try {
+        const sig = await this.settleCustody(sym);
+        out.push({ symbol: sym, sig });
+      } catch (err) {
+        out.push({ symbol: sym, sig: null, err: (err as Error).message });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Compute the user's actual available balance per token from the on-chain
+   * basket + UDL — same formula the program uses at line 175 of openPosition:
+   *   available = deposits − debits + pendingCredits
+   */
+  async getAvailableBalances(): Promise<Map<string, { available: number; deposits: number; debits: number; pendingCredits: number; decimals: number }>> {
+    const owner = this.wallet.publicKey;
+    const [basket, udl] = await Promise.all([
+      this.sdk.accounts.fetchBasket(owner).catch(() => null) as Promise<{ debits?: Array<{ mint: PublicKey; amount: BN }>; pendingCredits?: Array<{ mint: PublicKey; amount: BN }> } | null>,
+      this.sdk.accounts.fetchUserDepositLedger(owner).catch(() => null) as Promise<{ deposits?: Array<{ mint: PublicKey; amount: BN }> } | null>,
+    ]);
+    const map = new Map<string, { available: number; deposits: number; debits: number; pendingCredits: number; decimals: number }>();
+    for (const cust of this.poolConfig.custodies) {
+      const decimals = cust.decimals;
+      const dep = (udl?.deposits ?? []).find((d) => d.mint.equals(cust.mintKey))?.amount;
+      const deb = (basket?.debits ?? []).find((d) => d.mint.equals(cust.mintKey))?.amount;
+      const cred = (basket?.pendingCredits ?? []).find((d) => d.mint.equals(cust.mintKey))?.amount;
+      const depN = dep ? Number(dep.toString()) / 10 ** decimals : 0;
+      const debN = deb ? Number(deb.toString()) / 10 ** decimals : 0;
+      const credN = cred ? Number(cred.toString()) / 10 ** decimals : 0;
+      const available = depN - debN + credN;
+      if (depN === 0 && debN === 0 && credN === 0) continue;
+      map.set(cust.symbol, { available, deposits: depN, debits: debN, pendingCredits: credN, decimals });
+    }
+    return map;
   }
 
   /**

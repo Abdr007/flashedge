@@ -691,7 +691,48 @@ export const magicPrice: ToolDefinition = {
   },
 };
 
+/**
+ * Drain pendingCredits → deposits on the basket. Run this if `magic verify`
+ * shows pendingCredits > 0 — those credits don't count as fully usable until
+ * they're settled into the deposit pool.
+ */
+export const magicSettle: ToolDefinition = {
+  name: 'magicSettle',
+  description: 'Settle pending credits/debits in the basket. args: symbol? (default: settle every custody with pending state).',
+  parameters: z.object({ symbol: z.string().optional() }),
+  async execute(params, context): Promise<ToolResult> {
+    const client = buildMagicClient(context);
+    const symbol = (params.symbol as string | undefined)?.toUpperCase();
+    if (symbol) {
+      const sig = await client.settleCustody(symbol);
+      return {
+        success: true,
+        message: [
+          '',
+          chalk.green(`  Settled ${symbol}`),
+          chalk.dim('  ─────────────────'),
+          `  TX: ${chalk.dim(shortSig(sig))}  ${chalk.dim(solscanTx(sig, client.network))}`,
+          '',
+        ].join('\n'),
+        txSignature: sig,
+      };
+    }
+    const results = await client.settleAll();
+    if (results.length === 0) {
+      return { success: true, message: 'no pending credits/debits — nothing to settle' };
+    }
+    const lines = ['', chalk.green('  Settle Complete'), chalk.dim('  ─────────────────')];
+    for (const r of results) {
+      if (r.sig) lines.push(`  ${chalk.cyan(r.symbol.padEnd(6))} ${chalk.dim(shortSig(r.sig))}  ${chalk.dim(solscanTx(r.sig, client.network))}`);
+      else lines.push(`  ${chalk.red(r.symbol.padEnd(6))} ${chalk.red('failed:')} ${r.err}`);
+    }
+    lines.push('');
+    return { success: true, message: lines.join('\n'), data: { results } };
+  },
+};
+
 export const magicTools: ToolDefinition[] = [
+  magicSettle,
   magicInspect,
   magicStatus,
   magicDelegation,
