@@ -229,11 +229,12 @@ export class MagicTradeClient implements IFlashClient {
     const owner = this.wallet.publicKey;
 
     const [basket, ledger] = await Promise.all([
-      this.sdk.accounts.fetchBasket(owner).catch(() => null),
+      // Basket reads from ER (live state), UDL from L1 (where deposits are written).
+      this.erAccounts.fetchBasket(owner).catch(() => null),
       this.sdk.accounts.fetchUserDepositLedger(owner).catch(() => null),
     ]);
 
-    const positions = basket ? await this.buildPositionsFromBasket(basket) : [];
+    const positions = basket ? await this.buildPositionsFromBasket(basket as { positions: Array<{ market: PublicKey; position: unknown }> | null }) : [];
 
     let totalCollateralUsd = 0;
     let totalUnrealizedPnl = 0;
@@ -675,14 +676,27 @@ export class MagicTradeClient implements IFlashClient {
   }
 
   /**
-   * Settle a custody's pending credits/debits — moves matched entries off the
-   * basket and into the UDL deposit balance. Without this, a closed position's
-   * payout sits in `pendingCredits` and isn't usable for new trades. Returns
-   * the L1 signature.
+   * Read the ER's view of the basket (where openPosition actually executes).
+   * L1's basket is the latest committed snapshot — the ER state is "live" and
+   * what the program checks at trade time.
+   */
+  private get erAccounts(): { fetchBasket: (owner: PublicKey) => Promise<unknown>; fetchUserDepositLedger: (owner: PublicKey) => Promise<unknown> } {
+    const sdkAny = this.sdk as unknown as {
+      erAccounts: { fetchBasket: (owner: PublicKey) => Promise<unknown>; fetchUserDepositLedger: (owner: PublicKey) => Promise<unknown> } | null;
+      accounts: { fetchBasket: (owner: PublicKey) => Promise<unknown>; fetchUserDepositLedger: (owner: PublicKey) => Promise<unknown> };
+    };
+    return sdkAny.erAccounts ?? sdkAny.accounts;
+  }
+
+  /**
+   * Settle a custody's pending credits/debits on the ER — moves matched entries
+   * off the basket and into the UDL deposit balance. Without this, a closed
+   * position's payout sits in `pendingCredits` and isn't usable for new trades.
+   * Sent to the ER (the basket dirt lives there, not on L1). Returns the sig.
    */
   async settleCustody(custodySymbol: string): Promise<string> {
     const result = await this.sdk.processCustodySettlementEr(custodySymbol, this.poolConfig);
-    return this.sendL1Ixs(result.instructions, result.additionalSigners, `magic.settle.${custodySymbol}`);
+    return this.sendErIxs(result.instructions, result.additionalSigners, `magic.settle.${custodySymbol}`);
   }
 
   /**
@@ -690,7 +704,8 @@ export class MagicTradeClient implements IFlashClient {
    * user's basket. Returns one signature per settled custody.
    */
   async settleAll(): Promise<Array<{ symbol: string; sig: string | null; err?: string }>> {
-    const basket = (await this.sdk.accounts.fetchBasket(this.wallet.publicKey).catch(() => null)) as
+    // Read from ER — the basket on L1 is the last-committed snapshot, not live state.
+    const basket = (await this.erAccounts.fetchBasket(this.wallet.publicKey).catch(() => null)) as
       | { debits?: Array<{ mint: PublicKey; amount: BN }>; pendingCredits?: Array<{ mint: PublicKey; amount: BN }> }
       | null;
     const symbols = new Set<string>();
@@ -721,8 +736,9 @@ export class MagicTradeClient implements IFlashClient {
    */
   async getAvailableBalances(): Promise<Map<string, { available: number; deposits: number; debits: number; pendingCredits: number; decimals: number }>> {
     const owner = this.wallet.publicKey;
+    // Read basket from ER (it's where openPosition checks state); UDL stays on L1.
     const [basket, udl] = await Promise.all([
-      this.sdk.accounts.fetchBasket(owner).catch(() => null) as Promise<{ debits?: Array<{ mint: PublicKey; amount: BN }>; pendingCredits?: Array<{ mint: PublicKey; amount: BN }> } | null>,
+      this.erAccounts.fetchBasket(owner).catch(() => null) as Promise<{ debits?: Array<{ mint: PublicKey; amount: BN }>; pendingCredits?: Array<{ mint: PublicKey; amount: BN }> } | null>,
       this.sdk.accounts.fetchUserDepositLedger(owner).catch(() => null) as Promise<{ deposits?: Array<{ mint: PublicKey; amount: BN }> } | null>,
     ]);
     const map = new Map<string, { available: number; deposits: number; debits: number; pendingCredits: number; decimals: number }>();
@@ -874,7 +890,7 @@ export class MagicTradeClient implements IFlashClient {
   }
 
   async fetchBasket(): Promise<unknown> {
-    return this.sdk.accounts.fetchBasket(this.wallet.publicKey).catch(() => null);
+    return this.erAccounts.fetchBasket(this.wallet.publicKey).catch(() => null);
   }
 
   async fetchUserDepositLedger(): Promise<unknown> {
