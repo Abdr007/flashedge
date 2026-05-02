@@ -60,6 +60,10 @@
     "node": ">=20.0.0"
   },
   "license": "MIT",
+  "//overrides": "Pin bs58 to v5 — v6 is ESM-only with a CJS facade that only exports `default`, breaking @flash_trade/magic-trade-client's erWire.js (which does `require('bs58').decode`). v5 has the same encode/decode API.",
+  "overrides": {
+    "bs58": "$bs58"
+  },
   "dependencies": {
     "@coral-xyz/anchor": "0.32.1",
     "@flash_trade/magic-trade-client": "^1.0.22",

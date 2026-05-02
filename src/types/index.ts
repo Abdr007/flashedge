@@ -1194,7 +1194,7 @@ export interface FlashConfig {
    * Trade), devnet default `FMTgs…txvj`.
    */
   magicProgramId: string;
-  /** Magic mode: session key lifetime in seconds. Default 7200 (2h). */
+  /** Magic mode: session key lifetime in seconds. Default 604800 (7 days, matches flash.trade v2 official UX). */
   magicSessionDurationSec: number;
   /** Magic mode: auto-mint a session on first trade. Default true. */
   magicAutoSession: boolean;

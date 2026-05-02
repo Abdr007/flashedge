@@ -270,7 +270,7 @@ export function loadConfig(): FlashConfig {
           (isMainnet
             ? 'FTv2RxXarPfNta45HTTMVaGvjzsGg27FXJ3hEKWBhrzV'
             : 'FMTgsEDaPPfJi1PKD67McLTC5n833T4irbBP53LLxtvj'),
-        magicSessionDurationSec: parseIntSafe(process.env.MAGIC_SESSION_DURATION_SEC, 7200),
+        magicSessionDurationSec: parseIntSafe(process.env.MAGIC_SESSION_DURATION_SEC, 604800),
         magicAutoSession: (process.env.MAGIC_AUTO_SESSION ?? 'true').toLowerCase() !== 'false',
         magicFastConfirm: (process.env.MAGIC_FAST_CONFIRM ?? 'true').toLowerCase() !== 'false',
       };
