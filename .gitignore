@@ -54,3 +54,4 @@ docs/*.pdf
 *.log.old
 *.log.old.*
 flash-debug.*
+.vercel

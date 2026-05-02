@@ -6,6 +6,7 @@ import { allSwapTools } from './swap-tools.js';
 import { allEarnTools } from './earn-tools.js';
 import { allEngineTools } from './engine-tools.js';
 import { allFafTools } from './faf-tools.js';
+import { magicTools } from './magic-tools.js';
 import { profilingSummaryTool } from '../observability/profiler.js';
 import { runMiddleware } from '../core/execution-middleware.js';
 import { theme } from '../cli/theme.js';
@@ -39,6 +40,9 @@ export class ToolEngine {
     for (const tool of allFafTools) {
       this.registry.register(tool);
     }
+    for (const tool of magicTools) {
+      this.registry.register(tool);
+    }
     this.registry.register(profilingSummaryTool);
     // Lock core tools — plugins cannot override them
     this.registry.lockCore();
@@ -49,6 +53,11 @@ export class ToolEngine {
    */
   registerTool(tool: ToolDefinition): void {
     this.registry.register(tool);
+  }
+
+  /** Execute a tool by name directly — used by out-of-band dispatchers (e.g. `magic *`). */
+  async executeTool(name: string, params: Record<string, unknown> = {}): Promise<ToolResult> {
+    return this.registry.execute(name, params, this.context);
   }
 
   /**

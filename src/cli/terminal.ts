@@ -348,8 +348,20 @@ export class FlashTerminal {
       process.exit(0);
     }
 
-    this.config.simulationMode = mode === 'simulation';
+    this.config.tradingMode = mode;
+    this.config.simulationMode = mode !== 'live';
     this.modeLocked = true;
+    // Persist so restarts remember — user can override with env TRADING_MODE.
+    void (async () => {
+      try {
+        const { saveTradingMode } = await import('../config/index.js');
+        saveTradingMode(mode);
+      } catch {
+        /* best-effort */
+      }
+    })();
+
+
 
     // Re-initialize signing guard with relaxed rate limits for simulation
     if (this.config.simulationMode) {
@@ -365,10 +377,11 @@ export class FlashTerminal {
     // ─── Mode-Specific Setup ──────────────────────────────────────────
     let walletInfo: { address: string; name: string } | null = null;
 
-    if (mode === 'live') {
+    if (mode === 'live' || mode === 'magic') {
+      // Magic mode needs a real keypair to derive basket/UDL PDAs + sign on-chain ixs.
+      // Reuse the live-mode wallet flow (wallet load/create/select).
       walletInfo = await this.setupLiveMode();
       if (!walletInfo) {
-        // User chose exit from wallet menu
         console.log(chalk.dim('\n  Goodbye.\n'));
         this.rl.close();
         process.exit(0);
@@ -481,6 +494,7 @@ export class FlashTerminal {
       flashClient: this.flashClient,
       dataClient: this.fstats,
       simulationMode: this.config.simulationMode,
+      tradingMode: this.config.tradingMode,
       degenMode: false,
       walletAddress: walletInfo?.address ?? this.flashClient.walletAddress ?? 'unknown',
       walletName: walletInfo?.name ?? '',
@@ -837,10 +851,32 @@ export class FlashTerminal {
     this.rl = createInterface({ input: process.stdin, output: process.stdout });
     this.rl.pause();
 
-    // Determine mode from environment
+    // Determine mode from environment. TRADING_MODE wins; SIMULATION_MODE is legacy.
+    const envMode = process.env.TRADING_MODE?.toLowerCase();
     const explicitLive = process.env.SIMULATION_MODE?.toLowerCase() === 'false';
-    this.config.simulationMode = !explicitLive;
+    const agentMode: 'live' | 'simulation' | 'magic' =
+      envMode === 'live' || envMode === 'simulation' || envMode === 'magic'
+        ? (envMode as 'live' | 'simulation' | 'magic')
+        : explicitLive
+          ? 'live'
+          : 'simulation';
+    this.config.tradingMode = agentMode;
+    this.config.simulationMode = agentMode !== 'live';
     this.modeLocked = true;
+
+    // In agent mode with magic, auto-load default wallet so magic tools get a Keypair.
+    if (agentMode === 'magic') {
+      try {
+        const { WalletStore } = await import('../wallet/wallet-store.js');
+        const store = new WalletStore();
+        const def = store.getDefault();
+        if (def && !this.walletManager.isConnected) {
+          this.walletManager.loadFromFile(store.getWalletPath(def));
+        }
+      } catch {
+        /* best-effort */
+      }
+    }
 
     // Re-init signing guard for simulation
     if (this.config.simulationMode) {
@@ -889,6 +925,7 @@ export class FlashTerminal {
       flashClient: this.flashClient,
       dataClient: this.fstats,
       simulationMode: this.config.simulationMode,
+      tradingMode: this.config.tradingMode,
       degenMode: false,
       walletAddress: this.flashClient.walletAddress ?? 'unknown',
       walletName: '',
@@ -925,9 +962,11 @@ export class FlashTerminal {
 
   // ─── Welcome Screen ────────────────────────────────────────────────
 
-  private async showModeSelection(): Promise<'live' | 'simulation' | 'exit'> {
-    // NO_DNA: never prompt — default to simulation (safe), or live if SIMULATION_MODE=false
+  private async showModeSelection(): Promise<'live' | 'simulation' | 'magic' | 'exit'> {
+    // NO_DNA: never prompt. Honour TRADING_MODE, fall back to SIMULATION_MODE legacy env.
     if (IS_AGENT) {
+      const envMode = process.env.TRADING_MODE?.toLowerCase();
+      if (envMode === 'live' || envMode === 'simulation' || envMode === 'magic') return envMode;
       const explicitLive = process.env.SIMULATION_MODE?.toLowerCase() === 'false';
       return explicitLive ? 'live' : 'simulation';
     }
@@ -949,7 +988,10 @@ export class FlashTerminal {
     console.log(`    ${theme.command('2)')} ${theme.section('SIMULATION')}`);
     console.log(theme.dim('       Test strategies using paper trading.'));
     console.log('');
-    console.log(`    ${theme.command('3)')} ${theme.dim('Exit')}`);
+    console.log(`    ${theme.command('3)')} ${theme.section('MAGIC TRADING')} ${chalk.red('[DEVNET]')}`);
+    console.log(theme.dim('       Flash Magic Trade on MagicBlock ER — session-key UX, sub-50ms.'));
+    console.log('');
+    console.log(`    ${theme.command('4)')} ${theme.dim('Exit')}`);
     console.log('');
 
     while (true) {
@@ -961,9 +1003,11 @@ export class FlashTerminal {
         case '2':
           return 'simulation';
         case '3':
+          return 'magic';
+        case '4':
           return 'exit';
         default:
-          console.log(chalk.dim('  Enter 1, 2, or 3.'));
+          console.log(chalk.dim('  Enter 1, 2, 3, or 4.'));
           continue;
       }
     }
@@ -1105,14 +1149,19 @@ export class FlashTerminal {
   private async showIntelligenceScreen(walletName: string | null, prefetchedBalances?: unknown): Promise<void> {
     // NO_DNA: emit structured ready event, skip TUI
     if (IS_AGENT) {
-      const isSim = this.config.simulationMode;
+      const isSim = this.config.tradingMode === 'simulation';
+      const isMagic = this.config.tradingMode === 'magic';
       const readyData: Record<string, unknown> = {
         status: 'ready',
-        mode: isSim ? 'simulation' : 'live',
-        wallet: walletName ?? (isSim ? 'paper' : 'none'),
+        mode: this.config.tradingMode,
+        wallet: walletName ?? (isSim ? 'paper' : isMagic ? this.walletManager?.address ?? 'none' : 'none'),
         wallet_address: this.walletManager?.address ?? null,
         rpc_endpoint: this.rpcManager?.activeEndpoint?.label ?? null,
       };
+      if (isMagic) {
+        readyData.magic_program = this.config.magicProgramId;
+        readyData.magic_router = this.config.magicRpcUrl;
+      }
       if (isSim) {
         readyData.balance_usdc = this.flashClient.getBalance();
       }
@@ -1141,20 +1190,29 @@ export class FlashTerminal {
       return;
     }
 
-    const isSim = this.config.simulationMode;
-    const modeLabel = isSim ? 'SIMULATION' : 'LIVE TRADING';
-    const modeBg = isSim ? theme.simBadge : theme.liveBadge;
+    const isMagic = this.config.tradingMode === 'magic';
+    const isSim = this.config.tradingMode === 'simulation';
+    const modeLabel = isMagic ? 'MAGIC TRADING [DEVNET]' : isSim ? 'SIMULATION' : 'LIVE TRADING';
+    const modeBg = isMagic ? chalk.bgMagenta.white.bold : isSim ? theme.simBadge : theme.liveBadge;
 
     // Header
     console.log('');
     console.log(`  ${theme.accentBold('FLASH TERMINAL')}`);
     console.log(`  ${theme.separator(32)}`);
     console.log('');
-    console.log(`  ${modeBg(modeLabel)}`);
+    console.log(`  ${modeBg(' ' + modeLabel + ' ')}`);
     console.log('');
 
     // Wallet / Balance
-    if (isSim) {
+    if (isMagic && walletName) {
+      const walletAddr = this.walletManager.address;
+      console.log(theme.pair('Wallet', theme.accent(walletName)));
+      if (walletAddr) console.log(theme.pair('Address', theme.dim(walletAddr)));
+      console.log(theme.pair('Program', theme.value('FMTgsEDaPPfJi1PKD67McLTC5n833T4irbBP53LLxtvj')));
+      console.log(theme.pair('Router', theme.value(this.config.magicRpcUrl)));
+      console.log('');
+      console.log(theme.dim('  Run `magic status` to see preflight state, `magic setup` to initialise.'));
+    } else if (isSim) {
       console.log(theme.pair('Balance', theme.positive('$' + this.flashClient.getBalance().toFixed(2))));
       console.log(theme.dim('  Trades are simulated. No real transactions.'));
     } else if (walletName) {
@@ -1679,9 +1737,12 @@ export class FlashTerminal {
       this.rl.setPrompt('');
       return;
     }
-    const prefix = this.config.simulationMode
-      ? theme.warning('flash') + theme.dim(' [sim]')
-      : theme.negative('flash') + theme.dim(' [live]');
+    const prefix =
+      this.config.tradingMode === 'magic'
+        ? theme.accent('flash') + chalk.magenta(' [magic]')
+        : this.config.tradingMode === 'live'
+          ? theme.negative('flash') + theme.dim(' [live]')
+          : theme.warning('flash') + theme.dim(' [sim]');
     this.rl.setPrompt(`${prefix} ${theme.accent('>')} `);
   }
 
@@ -2227,6 +2288,149 @@ export class FlashTerminal {
       } catch {
         // command-help module not available — fall through to normal dispatch
       }
+    }
+
+    // Magic-mode commands — intercepted before FAST_DISPATCH since they're tri-mode
+    // gated, not part of the general intent grammar.
+    if (lower === 'magic' || lower.startsWith('magic ')) {
+      if (this.config.tradingMode !== 'magic') {
+        console.log('');
+        console.log(chalk.yellow('  `magic` commands require MAGIC TRADING mode. Current mode: ' + this.config.tradingMode));
+        console.log(chalk.dim('  Switch modes via TRADING_MODE env var or restart and select option 3.'));
+        console.log('');
+        return;
+      }
+      const raw = lower === 'magic' ? 'inspect' : lower.slice(6).trim();
+      const parts = raw.split(/\s+/);
+      const sub = parts[0] ?? 'inspect';
+      const resolved = (() => {
+        switch (sub) {
+          case 'inspect':
+          case '':
+            return { tool: 'magicInspect', params: {} };
+          case 'portfolio':
+            return { tool: 'magicPortfolio', params: {} };
+          case 'markets':
+            return { tool: 'magicMarkets', params: {} };
+          case 'delegation':
+          case 'delegated':
+            return { tool: 'magicDelegation', params: {} };
+          case 'status':
+            return { tool: 'magicStatus', params: {} };
+          case 'faucet':
+            return { tool: 'magicFaucet', params: {} };
+          case 'setup':
+            return { tool: 'magicSetup', params: {} };
+          case 'deposit': {
+            // magic deposit <mint> <amount>
+            if (parts.length < 3) return { error: 'usage: magic deposit <mint> <amount_u64>' };
+            return { tool: 'magicDeposit', params: { mint: parts[1], amount: parts[2] } };
+          }
+          case 'open': {
+            // magic open <symbol> <long|short> <collateralUsd> <leverage> [collateralToken]
+            if (parts.length < 5) return { error: 'usage: magic open <symbol> <long|short> <collateral_usd> <leverage> [collateralToken]' };
+            const side = parts[2];
+            if (side !== 'long' && side !== 'short') return { error: `side must be 'long' or 'short' (got '${side}')` };
+            const collateral = Number(parts[3]);
+            const leverage = Number(parts[4]);
+            if (!Number.isFinite(collateral) || collateral <= 0) return { error: `collateral must be a positive number (got '${parts[3]}')` };
+            if (!Number.isFinite(leverage) || leverage <= 0) return { error: `leverage must be a positive number (got '${parts[4]}')` };
+            return {
+              tool: 'magicOpen',
+              params: {
+                market: parts[1],
+                side,
+                collateral,
+                leverage,
+                ...(parts[5] ? { collateralToken: parts[5] } : {}),
+              },
+            };
+          }
+          case 'close': {
+            // magic close <symbol> <long|short> [receiveToken]
+            if (parts.length < 3) return { error: 'usage: magic close <symbol> <long|short> [receiveToken]' };
+            const side = parts[2];
+            if (side !== 'long' && side !== 'short') return { error: `side must be 'long' or 'short' (got '${side}')` };
+            return {
+              tool: 'magicClose',
+              params: {
+                market: parts[1],
+                side,
+                ...(parts[3] ? { receiveToken: parts[3] } : {}),
+              },
+            };
+          }
+          case 'add':
+          case 'add-collateral': {
+            // magic add <symbol> <long|short> <amountUsd>
+            if (parts.length < 4) return { error: 'usage: magic add <symbol> <long|short> <amount_usd>' };
+            const side = parts[2];
+            if (side !== 'long' && side !== 'short') return { error: `side must be 'long' or 'short' (got '${side}')` };
+            const amount = Number(parts[3]);
+            if (!Number.isFinite(amount) || amount <= 0) return { error: `amount must be a positive number (got '${parts[3]}')` };
+            return { tool: 'magicAddCollateral', params: { market: parts[1], side, amount } };
+          }
+          case 'remove':
+          case 'remove-collateral': {
+            // magic remove <symbol> <long|short> <amountUsd>
+            if (parts.length < 4) return { error: 'usage: magic remove <symbol> <long|short> <amount_usd>' };
+            const side = parts[2];
+            if (side !== 'long' && side !== 'short') return { error: `side must be 'long' or 'short' (got '${side}')` };
+            const amount = Number(parts[3]);
+            if (!Number.isFinite(amount) || amount <= 0) return { error: `amount must be a positive number (got '${parts[3]}')` };
+            return { tool: 'magicRemoveCollateral', params: { market: parts[1], side, amount } };
+          }
+          case 'session': {
+            // magic session start [durationSec] | stop | status
+            const action = parts[1] ?? 'status';
+            if (action === 'start') {
+              const d = parts[2] ? Number(parts[2]) : undefined;
+              if (parts[2] && (!Number.isFinite(d) || (d as number) <= 0)) {
+                return { error: `durationSec must be a positive integer (got '${parts[2]}')` };
+              }
+              return { tool: 'magicSessionStart', params: d ? { durationSec: d } : {} };
+            }
+            if (action === 'stop' || action === 'revoke') return { tool: 'magicSessionStop', params: {} };
+            if (action === 'status' || action === 'list' || action === '') return { tool: 'magicSessionStatus', params: {} };
+            return { error: `unknown session subcommand '${action}' — expected start|stop|status` };
+          }
+          default:
+            return { error: null };
+        }
+      })();
+      if (!('tool' in resolved)) {
+        console.log('');
+        if (resolved.error) {
+          console.log(chalk.yellow(`  ${resolved.error}`));
+        } else {
+          console.log(chalk.yellow(`  Unknown magic subcommand: "${sub}"`));
+          console.log(chalk.dim('  Available:'));
+          console.log(chalk.dim('    magic inspect                        — enumerate pools/markets/custodies'));
+          console.log(chalk.dim('    magic status                         — wallet preflight (SOL, UDL, basket)'));
+          console.log(chalk.dim('    magic portfolio                      — your positions + balance'));
+          console.log(chalk.dim('    magic markets                        — list Market pubkeys'));
+          console.log(chalk.dim('    magic delegation                     — basket delegation status'));
+          console.log(chalk.dim('    magic faucet                         — where to get devnet SOL + stable tokens'));
+          console.log(chalk.dim('    magic setup                          — init UDL + basket + delegate (idempotent)'));
+          console.log(chalk.dim('    magic deposit <mint> <amount_u64>    — deposit collateral to UDL (L1)'));
+          console.log(chalk.dim('    magic open <symbol> <long|short> <collateral_usd> <leverage> [collateralToken]'));
+          console.log(chalk.dim('    magic close <symbol> <long|short> [receiveToken]'));
+          console.log(chalk.dim('    magic add <symbol> <long|short> <amount_usd>      — add collateral'));
+          console.log(chalk.dim('    magic remove <symbol> <long|short> <amount_usd>   — remove collateral'));
+          console.log(chalk.dim('    magic session start [durationSec]    — mint session key (skip wallet prompts)'));
+          console.log(chalk.dim('    magic session stop                   — revoke session key'));
+          console.log(chalk.dim('    magic session status                 — list active sessions'));
+        }
+        console.log('');
+        return;
+      }
+      try {
+        const result = await this.engine.executeTool(resolved.tool!, resolved.params!);
+        console.log(result.message);
+      } catch (err) {
+        console.log(chalk.red(`  magic error: ${(err as Error).message}`));
+      }
+      return;
     }
 
     // Fast dispatch for single-token commands

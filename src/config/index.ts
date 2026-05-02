@@ -1,5 +1,12 @@
 import dotenv from 'dotenv';
-import { FlashConfig, VALID_NETWORKS, Network, injectLeverageFn } from '../types/index.js';
+import {
+  FlashConfig,
+  VALID_NETWORKS,
+  Network,
+  VALID_TRADING_MODES,
+  TradingMode,
+  injectLeverageFn,
+} from '../types/index.js';
 import { homedir } from 'os';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -44,6 +51,46 @@ function parseNetwork(value: string | undefined): Network {
     return value as Network;
   }
   return 'mainnet-beta';
+}
+
+/**
+ * Resolve the active trading mode.
+ * Precedence: TRADING_MODE env > ~/.flash/mode file > SIMULATION_MODE back-compat > default 'simulation'.
+ */
+function resolveTradingMode(): TradingMode {
+  const envMode = process.env.TRADING_MODE?.toLowerCase();
+  if (envMode && (VALID_TRADING_MODES as readonly string[]).includes(envMode)) {
+    return envMode as TradingMode;
+  }
+
+  try {
+    const modeFile = resolve(homedir(), '.flash', 'mode');
+    if (existsSync(modeFile)) {
+      const stored = readFileSync(modeFile, 'utf8').trim().toLowerCase();
+      if ((VALID_TRADING_MODES as readonly string[]).includes(stored)) {
+        return stored as TradingMode;
+      }
+    }
+  } catch {
+    /* fall through */
+  }
+
+  // Back-compat with SIMULATION_MODE
+  const simEnv = process.env.SIMULATION_MODE?.toLowerCase();
+  if (simEnv === 'false') return 'live';
+  if (simEnv === 'true') return 'simulation';
+
+  return 'simulation';
+}
+
+/** Persist trading mode to ~/.flash/mode so it survives restarts. */
+export function saveTradingMode(mode: TradingMode): void {
+  try {
+    mkdirSync(resolve(homedir(), '.flash'), { recursive: true });
+    writeFileSync(resolve(homedir(), '.flash', 'mode'), mode + '\n', 'utf8');
+  } catch {
+    /* best-effort */
+  }
 }
 
 export function validateRpcUrl(url: string): string {
@@ -192,7 +239,42 @@ export function loadConfig(): FlashConfig {
     walletPath: resolveHome(process.env.WALLET_PATH || '~/.config/solana/id.json'),
     defaultPool: process.env.DEFAULT_POOL || (typeof file.default_pool === 'string' ? file.default_pool : 'Crypto.1'),
     network: parseNetwork(process.env.NETWORK || (typeof file.network === 'string' ? file.network : undefined)),
-    simulationMode: (process.env.SIMULATION_MODE ?? 'true').toLowerCase() !== 'false',
+    tradingMode: (() => {
+      const m = resolveTradingMode();
+      return m;
+    })(),
+    simulationMode: resolveTradingMode() !== 'live',
+    ...(() => {
+      // Magic-mode network defaults — mainnet is the real product, devnet is for testing.
+      const net = (process.env.MAGIC_NETWORK ?? 'mainnet-beta').toLowerCase() === 'devnet'
+        ? 'devnet'
+        : 'mainnet-beta';
+      const isMainnet = net === 'mainnet-beta';
+      const baseRpcDefault = process.env.RPC_URL || rpcDefault;
+      return {
+        magicNetwork: net as 'mainnet-beta' | 'devnet',
+        magicPoolName:
+          process.env.MAGIC_POOL_NAME || (isMainnet ? 'Pool.0' : 'Pool.1'),
+        magicRpcUrl: validateRpcUrl(
+          process.env.MAGIC_RPC_URL ||
+            (isMainnet ? 'https://flashtrade.magicblock.app/' : 'https://devnet-router.magicblock.app/'),
+        ),
+        magicEnumerationRpcUrl: validateRpcUrl(
+          process.env.MAGIC_ENUMERATION_RPC_URL || 'https://devnet-as.magicblock.app',
+        ),
+        magicL1RpcUrl: validateRpcUrl(
+          process.env.MAGIC_L1_RPC_URL || (isMainnet ? baseRpcDefault : 'https://api.devnet.solana.com'),
+        ),
+        magicProgramId:
+          process.env.MAGIC_PROGRAM_ID ||
+          (isMainnet
+            ? 'FTv2RxXarPfNta45HTTMVaGvjzsGg27FXJ3hEKWBhrzV'
+            : 'FMTgsEDaPPfJi1PKD67McLTC5n833T4irbBP53LLxtvj'),
+        magicSessionDurationSec: parseIntSafe(process.env.MAGIC_SESSION_DURATION_SEC, 7200),
+        magicAutoSession: (process.env.MAGIC_AUTO_SESSION ?? 'true').toLowerCase() !== 'false',
+        magicFastConfirm: (process.env.MAGIC_FAST_CONFIRM ?? 'true').toLowerCase() !== 'false',
+      };
+    })(),
     defaultSlippageBps: parseIntSafe(
       process.env.DEFAULT_SLIPPAGE_BPS,
       typeof file.default_slippage_bps === 'number' ? file.default_slippage_bps : 150,
@@ -254,6 +336,27 @@ export const DEFAULT_REFERRER_ADDRESS = 'Dvvzg9rwaNfUqBSscoMZJa5CHFv8Lm94ngZrRyL
 export const FLASH_PROGRAM_ID = 'FLASH6Lo6h3iasJKWDs2F8TkW2UKf3s15C8PMGuVfgBn';
 export const FLASH_COMPOSABILITY_PROGRAM_ID = 'FSWAPViR8ny5K96hezav8jynVubP2dJ2L7SbKzds2hwm';
 export const FLASH_REWARD_PROGRAM_ID = 'FARNT7LL119pmy9vSkN9q1ApZESPaKHuuX5Acz1oBoME';
+
+// Flash Magic Trade (Ephemeral Rollup) constants
+//
+// Mainnet: program is the same as L1 Flash Trade (FTv2…hrzV), pool delegated
+// to MagicBlock's ER. Pool.0 is mainnet's only Magic-Block pool today.
+// Router: https://flashtrade.magicblock.app/ — Flash's dedicated ER endpoint.
+//
+// Devnet: separate FMT program (FMTgs…txvj) with Pool.1/2/3 for testing.
+// Router/AS: the public MagicBlock devnet endpoints.
+export const MAGIC_TRADE_PROGRAM_ID_MAINNET = 'FTv2RxXarPfNta45HTTMVaGvjzsGg27FXJ3hEKWBhrzV';
+export const MAGIC_TRADE_PROGRAM_ID_DEVNET = 'FMTgsEDaPPfJi1PKD67McLTC5n833T4irbBP53LLxtvj';
+/** @deprecated use MAGIC_TRADE_PROGRAM_ID_MAINNET / _DEVNET. Kept for back-compat. */
+export const MAGIC_TRADE_PROGRAM_ID = MAGIC_TRADE_PROGRAM_ID_DEVNET;
+export const MAGIC_ROUTER_URL_MAINNET = 'https://flashtrade.magicblock.app/';
+export const MAGIC_ROUTER_URL_DEVNET = 'https://devnet-router.magicblock.app/';
+/** @deprecated use MAGIC_ROUTER_URL_MAINNET / _DEVNET. */
+export const MAGIC_ROUTER_URL = MAGIC_ROUTER_URL_DEVNET;
+export const MAGIC_ROUTER_WS = 'wss://devnet-router.magicblock.app/';
+export const MAGIC_VALIDATOR_AS_URL = 'https://devnet-as.magicblock.app';
+export const MAGIC_POOL_NAME_MAINNET = 'Pool.0';
+export const MAGIC_POOL_NAME_DEVNET = 'Pool.1';
 
 // fstats.io API
 export const FSTATS_BASE_URL = 'https://fstats.io/api/v1';

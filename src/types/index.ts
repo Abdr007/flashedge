@@ -1097,7 +1097,9 @@ export interface ToolResult {
 export interface ToolContext {
   flashClient: IFlashClient;
   dataClient: IDataClient;
+  /** @deprecated Derived as `tradingMode !== 'live'`. Prefer `tradingMode`. */
   simulationMode: boolean;
+  tradingMode: TradingMode;
   degenMode: boolean;
   walletAddress: string;
   walletName: string;
@@ -1139,6 +1141,15 @@ export interface ToolDefinition<TParams = Record<string, unknown>> {
 export const VALID_NETWORKS = ['mainnet-beta', 'devnet'] as const;
 export type Network = (typeof VALID_NETWORKS)[number];
 
+/**
+ * Trading mode selector. Replaces the old SIMULATION_MODE boolean.
+ * - `live`:       mainnet Flash perps (FLASH6Lo...) via flash-sdk
+ * - `simulation`: local paper trading (no network writes)
+ * - `magic`:      Flash Magic Trade on MagicBlock ER (FMTgsEDa...) via @magicblock-labs/ephemeral-rollups-sdk
+ */
+export const VALID_TRADING_MODES = ['live', 'simulation', 'magic'] as const;
+export type TradingMode = (typeof VALID_TRADING_MODES)[number];
+
 export interface FlashConfig {
   rpcUrl: string;
   backupRpcUrls: string[];
@@ -1146,7 +1157,54 @@ export interface FlashConfig {
   walletPath: string;
   defaultPool: string;
   network: Network;
+  /** @deprecated use `tradingMode` — kept for back-compat; derived as `tradingMode !== 'live'`. */
   simulationMode: boolean;
+  tradingMode: TradingMode;
+  /**
+   * Magic mode: cluster the Magic Trade pool lives on. Mainnet uses the
+   * existing Flash Trade L1 program (FTv2…hrzV) delegated to the ER; devnet
+   * uses the standalone FMT program (FMTgs…txvj). Default `'mainnet-beta'`.
+   */
+  magicNetwork: 'mainnet-beta' | 'devnet';
+  /**
+   * Magic mode: PoolConfig name to load via SDK's PoolConfig.fromIdsByName.
+   * Mainnet default `'Pool.0'`, devnet default `'Pool.1'`.
+   */
+  magicPoolName: string;
+  /**
+   * Magic mode: ER router URL for writes + closest-validator routing.
+   * Mainnet default `https://flashtrade.magicblock.app/`, devnet default
+   * `https://devnet-router.magicblock.app/`.
+   */
+  magicRpcUrl: string;
+  /**
+   * Magic mode: regional validator RPC for enumeration-style reads.
+   * Default `https://devnet-as.magicblock.app` (devnet). Mainnet enumeration
+   * is served by the SDK over the router; this is kept for back-compat.
+   */
+  magicEnumerationRpcUrl: string;
+  /**
+   * Magic mode: L1 (base-chain) RPC for UDL reads, deposits, init+delegate ixs.
+   * Mainnet default falls back to `RPC_URL` (paid mainnet), devnet defaults to
+   * `https://api.devnet.solana.com`.
+   */
+  magicL1RpcUrl: string;
+  /**
+   * Magic mode: FMT program ID. Mainnet default `FTv2…hrzV` (same as L1 Flash
+   * Trade), devnet default `FMTgs…txvj`.
+   */
+  magicProgramId: string;
+  /** Magic mode: session key lifetime in seconds. Default 7200 (2h). */
+  magicSessionDurationSec: number;
+  /** Magic mode: auto-mint a session on first trade. Default true. */
+  magicAutoSession: boolean;
+  /**
+   * Magic mode: when true (default), ER trade ixs use skipConfirm — returns the
+   * signature within ~30-50ms after submission and polls for confirmation in the
+   * background. When false, blocks until the ER commit lands (~500-800ms).
+   * Set MAGIC_FAST_CONFIRM=false in .env for synchronous trades.
+   */
+  magicFastConfirm: boolean;
   defaultSlippageBps: number;
   computeUnitLimit: number;
   computeUnitPrice: number;
