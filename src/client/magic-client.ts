@@ -122,10 +122,6 @@ export class MagicTradeClient implements IFlashClient {
   private readonly sdk: MagicTradePerpetualsClient;
   private readonly erEndpoint: string;
 
-  /** Active session keypair — when set, ER txs sign with this rather than the owner. */
-  private sessionKeypair: Keypair | null = null;
-  private sessionExpiresAt = 0;
-
   /** When true, ER trade ixs use skipConfirm and return immediately. */
   private readonly fastConfirm: boolean;
 
@@ -678,71 +674,6 @@ export class MagicTradeClient implements IFlashClient {
   async depositDirect(tokenMint: PublicKey, amountRaw: bigint): Promise<string> {
     const result = await this.sdk.depositDirect(tokenMint, new BN(amountRaw.toString()));
     return this.sendL1Ixs(result.instructions, result.additionalSigners, 'magic.depositDirect');
-  }
-
-  // ─── Session keys (P3 wires creation; activation is here) ─────────────────
-
-  /**
-   * Track a session keypair locally for future use.
-   *
-   * NOTE: We deliberately do NOT call `this.sdk.useSession()` here, because
-   * session_token PDAs created via `gum_session_keys` live on L1 — the
-   * MagicBlock ER (which actually executes our trade ixs) can't see them
-   * without delegation. Including a session_token in an ER ix triggers
-   * `Custom(3012) AccountNotInitialized` from the FMT program.
-   *
-   * Until the SDK / Flash protocol ship session-token-on-ER, the CLI
-   * signs every trade with the owner keypair. This is still fast: no
-   * wallet popup (we read the keypair file), no rate-limit on prompts.
-   */
-  useSession(sessionKp: Keypair, expiresAt: number): void {
-    this.sessionKeypair = sessionKp;
-    this.sessionExpiresAt = expiresAt;
-    // Intentionally NOT activating on the SDK — see note above.
-    // this.sdk.useSession(sessionKp.publicKey);
-    log.info('magic-client', `session loaded (owner-signed for ER until session-on-ER lands) ${sessionKp.publicKey.toBase58().slice(0, 8)}…`);
-  }
-
-  clearSession(): void {
-    this.sessionKeypair = null;
-    this.sessionExpiresAt = 0;
-    this.sdk.useSession(null);
-  }
-
-  /**
-   * Returns true if a session keypair is loaded and unexpired. We keep it
-   * around for L1 ops that already work with sessions (createSession/revoke);
-   * ER trade signing is unaffected — the owner wallet is always used there.
-   */
-  hasActiveSession(): boolean {
-    if (!this.sessionKeypair) return false;
-    return this.sessionExpiresAt > Date.now() / 1000;
-  }
-
-  /** Build the createSession L1 ix; caller signs + sends. Returns the kp + ixs. */
-  async buildCreateSessionIxs(durationSec: number): Promise<{
-    sessionKeypair: Keypair;
-    expiresAt: number;
-    instructions: TransactionInstruction[];
-    additionalSigners: Signer[];
-  }> {
-    const sessionKp = Keypair.generate();
-    const validUntil = Math.floor(Date.now() / 1000) + durationSec;
-    const result = await this.sdk.createSession(sessionKp.publicKey, true, new BN(validUntil));
-    return {
-      sessionKeypair: sessionKp,
-      expiresAt: validUntil,
-      instructions: result.instructions,
-      additionalSigners: [...result.additionalSigners, sessionKp],
-    };
-  }
-
-  async revokeSession(): Promise<string | null> {
-    if (!this.sessionKeypair) return null;
-    const result = await this.sdk.revokeSession(this.sessionKeypair.publicKey);
-    const sig = await this.sendL1Ixs(result.instructions, result.additionalSigners, 'magic.revokeSession');
-    this.clearSession();
-    return sig;
   }
 
   // ─── Inspection helpers ────────────────────────────────────────────────────

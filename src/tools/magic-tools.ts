@@ -14,11 +14,9 @@
 
 import { z } from 'zod';
 import chalk from 'chalk';
-import { Connection, PublicKey, Transaction, sendAndConfirmTransaction, type Keypair } from '@solana/web3.js';
+import { Connection, PublicKey } from '@solana/web3.js';
 import { ToolDefinition, ToolContext, ToolResult, TradeSide } from '../types/index.js';
 import { MagicTradeClient } from '../client/magic-client.js';
-import { validateInstructionPrograms } from '../client/flash-client.js';
-import { loadSession, saveSession, clearSession, listSessions } from '../security/magic-session-store.js';
 import { formatPrice, formatUsd } from '../utils/format.js';
 
 /** Truncate a long base58 string for display: "5oZL8a…m9KJ". */
@@ -82,7 +80,7 @@ function buildMagicClient(context: ToolContext): MagicTradeClient {
     context.config?.magicL1RpcUrl ??
     (network === 'mainnet-beta' ? 'https://api.mainnet-beta.solana.com' : 'https://api.devnet.solana.com');
   const l1Connection = new Connection(l1Url, 'confirmed');
-  const client = new MagicTradeClient({
+  return new MagicTradeClient({
     wallet: kp,
     l1Connection,
     network,
@@ -92,13 +90,6 @@ function buildMagicClient(context: ToolContext): MagicTradeClient {
     prioritizationFee: context.config?.computeUnitPrice,
     fastConfirm: context.config?.magicFastConfirm ?? true,
   });
-
-  // Auto-resume a previously-persisted session if one is still valid.
-  const stored = loadSession(network, kp.publicKey.toBase58());
-  if (stored) {
-    client.useSession(stored.keypair, stored.expiresAt);
-  }
-  return client;
 }
 
 export const magicInspect: ToolDefinition = {
@@ -550,133 +541,6 @@ export const magicRemoveCollateral: ToolDefinition = {
 };
 
 /**
- * Mint a fresh session keypair, build the L1 createSession ix, sign it (owner +
- * session both required), and persist the keypair to disk so subsequent CLI
- * runs auto-resume it.
- */
-export const magicSessionStart: ToolDefinition = {
-  name: 'magicSessionStart',
-  description: 'Mint a session key for fast ER trades. args: durationSec? (default from config).',
-  parameters: z.object({ durationSec: z.number().int().positive().optional() }),
-  async execute(params, context): Promise<ToolResult> {
-    const client = buildMagicClient(context);
-    const kp = context.walletManager.getKeypair();
-    if (!kp) throw new Error('wallet not loaded');
-
-    if (client.hasActiveSession()) {
-      return {
-        success: true,
-        message: `session already active — run \`magic session stop\` first to rotate`,
-      };
-    }
-
-    const durationSec = (params.durationSec as number | undefined) ?? context.config?.magicSessionDurationSec ?? 604800;
-    const built = await client.buildCreateSessionIxs(durationSec);
-
-    // Same security gate as every other signing path.
-    validateInstructionPrograms(built.instructions, 'magic.createSession');
-
-    // L1-sign the createSession tx with both owner + session keys.
-    const l1Url =
-      context.config?.magicL1RpcUrl ??
-      (client.network === 'mainnet-beta' ? 'https://api.mainnet-beta.solana.com' : 'https://api.devnet.solana.com');
-    const l1Connection = new Connection(l1Url, 'confirmed');
-    const tx = new Transaction();
-    for (const ix of built.instructions) tx.add(ix);
-    const extraSigners = built.additionalSigners.filter((s): s is Keypair => 'secretKey' in s);
-    // Public mainnet RPCs reject preflight; skip it on mainnet (mirrors magic-client.sendL1Ixs).
-    const sig = await sendAndConfirmTransaction(l1Connection, tx, [kp, built.sessionKeypair, ...extraSigners], {
-      commitment: 'confirmed',
-      skipPreflight: client.network === 'mainnet-beta',
-    });
-
-    // Activate + persist.
-    client.useSession(built.sessionKeypair, built.expiresAt);
-    saveSession({
-      network: client.network,
-      ownerPubkey: kp.publicKey.toBase58(),
-      sessionPubkey: built.sessionKeypair.publicKey.toBase58(),
-      secretKey: Array.from(built.sessionKeypair.secretKey),
-      expiresAt: built.expiresAt,
-    });
-
-    return {
-      success: true,
-      message:
-        `✓ Session active — ER trades now sign with the session key (no owner-wallet prompts).\n` +
-        `  session pubkey:  ${built.sessionKeypair.publicKey.toBase58()}\n` +
-        `  expires at:      ${new Date(built.expiresAt * 1000).toISOString()}\n` +
-        `  duration:        ${durationSec}s\n` +
-        `  L1 tx:           ${sig}`,
-      txSignature: sig,
-    };
-  },
-};
-
-export const magicSessionStop: ToolDefinition = {
-  name: 'magicSessionStop',
-  description: 'Revoke the active session key (rent returns to owner).',
-  async execute(_params, context): Promise<ToolResult> {
-    const client = buildMagicClient(context);
-    const kp = context.walletManager.getKeypair();
-    if (!kp) throw new Error('wallet not loaded');
-
-    if (!client.hasActiveSession()) {
-      // Always sweep on-disk state — handles the case where it was on disk but expired.
-      clearSession(client.network, kp.publicKey.toBase58());
-      return { success: true, message: 'no active session — nothing to revoke' };
-    }
-    // Try on-chain revoke first; if it fails (e.g. network error, RPC issue),
-    // still sweep the on-disk session so the user isn't stuck. The session key
-    // expires on its own anyway via validUntil, so a failed revoke leaks at
-    // most the rent on the session-token PDA — not a security issue.
-    let sig: string | null = null;
-    let revokeErr: Error | null = null;
-    try {
-      sig = await client.revokeSession();
-    } catch (err) {
-      revokeErr = err as Error;
-    }
-    clearSession(client.network, kp.publicKey.toBase58());
-    if (revokeErr) {
-      return {
-        success: true,
-        message:
-          `⚠ on-chain revoke failed (${revokeErr.message}) — local session cleared anyway.\n` +
-          `  Session keypair will expire on its own; rerun \`magic session start\` to mint a fresh one.`,
-      };
-    }
-    return {
-      success: true,
-      message: sig ? `✓ Session revoked\n  tx: ${sig}` : '✓ Session cleared (no on-chain revocation needed)',
-      txSignature: sig ?? undefined,
-    };
-  },
-};
-
-export const magicSessionStatus: ToolDefinition = {
-  name: 'magicSessionStatus',
-  description: 'Show active session keys per wallet/network.',
-  async execute(_params, _context): Promise<ToolResult> {
-    const all = listSessions();
-    if (all.length === 0) {
-      return { success: true, message: 'no sessions stored — run `magic session start` to mint one' };
-    }
-    const now = Date.now() / 1000;
-    const lines = all.map((s) => {
-      const remaining = s.expiresAt - now;
-      const fresh = remaining > 30;
-      const tag = fresh ? '✓ active' : '✗ expired';
-      const remStr = fresh
-        ? `expires in ${Math.floor(remaining / 60)}m ${Math.floor(remaining % 60)}s`
-        : 'expired — clean up via `magic session stop`';
-      return `  ${tag} ${s.network.padEnd(13)} owner=${s.ownerPubkey.slice(0, 8)}… session=${s.sessionPubkey.slice(0, 8)}… ${remStr}`;
-    });
-    return { success: true, message: lines.join('\n'), data: { sessions: all } };
-  },
-};
-
-/**
  * Report the spot price for a market via the on-chain oracle, plus the oracle
  * account pubkey so the user can cross-check on Solscan/Pyth/etc.
  */
@@ -727,8 +591,5 @@ export const magicTools: ToolDefinition[] = [
   magicClose,
   magicAddCollateral,
   magicRemoveCollateral,
-  magicSessionStart,
-  magicSessionStop,
-  magicSessionStatus,
   magicFaucet,
 ];

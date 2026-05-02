@@ -2393,18 +2393,11 @@ export class FlashTerminal {
             return { tool: 'magicRemoveCollateral', params: { market: parts[1], side, amount } };
           }
           case 'session': {
-            // magic session start [durationSec] | stop | status
-            const action = parts[1] ?? 'status';
-            if (action === 'start') {
-              const d = parts[2] ? Number(parts[2]) : undefined;
-              if (parts[2] && (!Number.isFinite(d) || (d as number) <= 0)) {
-                return { error: `durationSec must be a positive integer (got '${parts[2]}')` };
-              }
-              return { tool: 'magicSessionStart', params: d ? { durationSec: d } : {} };
-            }
-            if (action === 'stop' || action === 'revoke') return { tool: 'magicSessionStop', params: {} };
-            if (action === 'status' || action === 'list' || action === '') return { tool: 'magicSessionStatus', params: {} };
-            return { error: `unknown session subcommand '${action}' — expected start|stop|status` };
+            return {
+              error:
+                'session keys removed — CLI signs trades directly from your wallet keypair file (sub-ms, no popup needed). ' +
+                'No setup required; just run `magic open <symbol> <side> <collateral> <leverage>`.',
+            };
           }
           default:
             return { error: null };
@@ -2430,9 +2423,6 @@ export class FlashTerminal {
           console.log(chalk.dim('    magic close <symbol> <long|short> [receiveToken]'));
           console.log(chalk.dim('    magic add <symbol> <long|short> <amount_usd>      — add collateral'));
           console.log(chalk.dim('    magic remove <symbol> <long|short> <amount_usd>   — remove collateral'));
-          console.log(chalk.dim('    magic session start [durationSec]    — mint session key (skip wallet prompts)'));
-          console.log(chalk.dim('    magic session stop                   — revoke session key'));
-          console.log(chalk.dim('    magic session status                 — list active sessions'));
         }
         console.log('');
         return;
