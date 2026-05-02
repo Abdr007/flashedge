@@ -385,7 +385,8 @@ const ED25519_PROGRAM = 'Ed25519SigVerify111111111111111111111111111'; // Ed2551
 // Magic-mode programs — used by FlashEdge magic mode only, but trusted at the
 // same level as Flash's own programs since they're invoked via SDK.
 const SESSION_KEYS_PROGRAM = 'KeyspM2ssCJbqUhQ4k7sveSiY4WjnYsrXkC8oDbwde5'; // gum_session_keys (createSession/revokeSession)
-const FMT_DEVNET_PROGRAM = 'FMTgsEDaPPfJi1PKD67McLTC5n833T4irbBP53LLxtvj'; // Flash Magic Trade devnet (mainnet uses FTv2…hrzV via PoolConfig)
+const FMT_MAINNET_PROGRAM = 'FTv2RxXarPfNta45HTTMVaGvjzsGg27FXJ3hEKWBhrzV'; // Flash Magic Trade mainnet (same on-chain program as L1 Flash Trade)
+const FMT_DEVNET_PROGRAM = 'FMTgsEDaPPfJi1PKD67McLTC5n833T4irbBP53LLxtvj'; // Flash Magic Trade devnet
 const MAGICBLOCK_DELEGATION_PROGRAM = 'DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh'; // MagicBlock ER delegation program (used by delegate_basket)
 
 // Flash Trade program IDs are loaded dynamically from PoolConfig.
@@ -405,6 +406,7 @@ const BASE_ALLOWED_PROGRAM_IDS = Object.freeze(
     EVENT_AUTHORITY,
     ED25519_PROGRAM,
     SESSION_KEYS_PROGRAM,
+    FMT_MAINNET_PROGRAM,
     FMT_DEVNET_PROGRAM,
     MAGICBLOCK_DELEGATION_PROGRAM,
   ]),
