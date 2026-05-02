@@ -16,6 +16,7 @@ import { z } from 'zod';
 import { Connection, PublicKey, Transaction, sendAndConfirmTransaction, type Keypair } from '@solana/web3.js';
 import { ToolDefinition, ToolContext, ToolResult, TradeSide } from '../types/index.js';
 import { MagicTradeClient } from '../client/magic-client.js';
+import { validateInstructionPrograms } from '../client/flash-client.js';
 import { loadSession, saveSession, clearSession, listSessions } from '../security/magic-session-store.js';
 
 /** USDC mints — mainnet vs devnet test stable. */
@@ -447,8 +448,11 @@ export const magicSessionStart: ToolDefinition = {
       };
     }
 
-    const durationSec = (params.durationSec as number | undefined) ?? context.config?.magicSessionDurationSec ?? 7200;
+    const durationSec = (params.durationSec as number | undefined) ?? context.config?.magicSessionDurationSec ?? 604800;
     const built = await client.buildCreateSessionIxs(durationSec);
+
+    // Same security gate as every other signing path.
+    validateInstructionPrograms(built.instructions, 'magic.createSession');
 
     // L1-sign the createSession tx with both owner + session keys.
     const l1Url =
@@ -500,8 +504,26 @@ export const magicSessionStop: ToolDefinition = {
       clearSession(client.network, kp.publicKey.toBase58());
       return { success: true, message: 'no active session — nothing to revoke' };
     }
-    const sig = await client.revokeSession();
+    // Try on-chain revoke first; if it fails (e.g. network error, RPC issue),
+    // still sweep the on-disk session so the user isn't stuck. The session key
+    // expires on its own anyway via validUntil, so a failed revoke leaks at
+    // most the rent on the session-token PDA — not a security issue.
+    let sig: string | null = null;
+    let revokeErr: Error | null = null;
+    try {
+      sig = await client.revokeSession();
+    } catch (err) {
+      revokeErr = err as Error;
+    }
     clearSession(client.network, kp.publicKey.toBase58());
+    if (revokeErr) {
+      return {
+        success: true,
+        message:
+          `⚠ on-chain revoke failed (${revokeErr.message}) — local session cleared anyway.\n` +
+          `  Session keypair will expire on its own; rerun \`magic session start\` to mint a fresh one.`,
+      };
+    }
     return {
       success: true,
       message: sig ? `✓ Session revoked\n  tx: ${sig}` : '✓ Session cleared (no on-chain revocation needed)',
