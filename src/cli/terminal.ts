@@ -1000,9 +1000,10 @@ export class FlashTerminal {
     console.log(theme.dim('       Test strategies using paper trading.'));
     console.log('');
     {
+      const { gradient, SPARK, BOLT } = await import('./magic-theme.js');
       const isDevnet = (process.env.MAGIC_NETWORK ?? 'mainnet-beta').toLowerCase() === 'devnet';
       const tail = isDevnet ? `  ${chalk.red('[DEVNET]')}` : '';
-      console.log(`    ${theme.command('3)')} ${theme.section('MAGIC TRADING')} ${chalk.dim('(v2)')}${tail}`);
+      console.log(`    ${theme.command('3)')} ${SPARK} ${gradient('MAGIC TRADING')} ${BOLT} ${chalk.dim('(v2)')}${tail}`);
     }
     console.log(theme.dim('       Flash Magic Trade on MagicBlock ER — sub-second confirms.'));
     console.log('');
@@ -1208,16 +1209,28 @@ export class FlashTerminal {
     const isMagic = this.config.tradingMode === 'magic';
     const isSim = this.config.tradingMode === 'simulation';
     const isMagicDevnet = (this.config.magicNetwork ?? 'mainnet-beta') !== 'mainnet-beta';
-    const modeLabel = isMagic ? (isMagicDevnet ? 'MAGIC TRADING [DEVNET]' : 'MAGIC TRADING (v2)') : isSim ? 'SIMULATION' : 'LIVE TRADING (v1)';
-    const modeBg = isMagic ? chalk.bgMagenta.white.bold : isSim ? theme.simBadge : theme.liveBadge;
+    const modeLabel = isSim ? 'SIMULATION' : 'LIVE TRADING (v1)';
+    const modeBg = isSim ? theme.simBadge : theme.liveBadge;
 
-    // Header
+    // Header — magic mode gets the unique gradient banner; live/sim keep the badge.
     console.log('');
-    console.log(`  ${theme.accentBold('FLASH TERMINAL')}`);
-    console.log(`  ${theme.separator(32)}`);
-    console.log('');
-    console.log(`  ${modeBg(' ' + modeLabel + ' ')}`);
-    console.log('');
+    if (isMagic) {
+      const { magicBanner, SPARK, BOLT, gradient } = await import('./magic-theme.js');
+      process.stdout.write(magicBanner());
+      if (isMagicDevnet) {
+        console.log(`  ${chalk.red('[ DEVNET ]')}  ${chalk.dim('— testnet pool, free SOL faucet')}`);
+        console.log('');
+      }
+      console.log(`  ${SPARK} ${gradient('FLASH TERMINAL')} ${SPARK}  ${BOLT} ${chalk.dim('v2 · ER routing live')}`);
+      console.log(`  ${theme.separator(50)}`);
+      console.log('');
+    } else {
+      console.log(`  ${theme.accentBold('FLASH TERMINAL')}`);
+      console.log(`  ${theme.separator(32)}`);
+      console.log('');
+      console.log(`  ${modeBg(' ' + modeLabel + ' ')}`);
+      console.log('');
+    }
 
     // Wallet / Balance
     if (isMagic && walletName) {
@@ -3551,6 +3564,13 @@ export class FlashTerminal {
     const skip = ['help', 'commands', '?', 'exit', 'quit'];
     if (skip.includes(this.lastCommand.toLowerCase())) return;
 
+    // Magic-mode latency uses the gradient pill; other modes keep plain.
+    if (this.config.tradingMode === 'magic') {
+      void import('./magic-theme.js').then(({ latencyPill }) => {
+        console.log(`  ${latencyPill(this.lastCommandMs)}`);
+      });
+      return;
+    }
     const ms = this.lastCommandMs;
     const seconds = ms / 1000;
     const timeStr = seconds < 1 ? `${seconds.toFixed(2)}s` : `${seconds.toFixed(1)}s`;

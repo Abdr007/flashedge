@@ -21,6 +21,7 @@ import { formatPrice, formatUsd } from '../utils/format.js';
 import { readMagicHistory, recordMagicTrade } from '../security/magic-history.js';
 import { startErHealthMonitor, getErHealthMonitor } from '../monitor/magic-er-health.js';
 import { startMagicAlerts, stopMagicAlerts, getMagicAlerts } from '../monitor/magic-alerts.js';
+import { renderCard, bar, SPARK, BOLT, ARROW, gradient } from '../cli/magic-theme.js';
 
 /** Truncate a long base58 string for display: "5oZL8a…m9KJ". */
 function shortSig(s: string): string {
@@ -568,20 +569,23 @@ export const magicOpen: ToolDefinition = {
       params.collateralToken as string | undefined,
     );
     const liqStr = result.liquidationPrice && result.liquidationPrice > 0 ? chalk.yellow(formatPrice(result.liquidationPrice)) : chalk.dim('N/A');
+    const sideColored = params.side === 'short' ? chalk.red.bold(String(params.side).toUpperCase()) : chalk.green.bold(String(params.side).toUpperCase());
+    const card = renderCard({
+      title: `${SPARK} ${chalk.green.bold('Position Opened')} ${BOLT}`,
+      width: 64,
+      border: chalk.cyanBright,
+      rows: [
+        { label: 'Market', value: `${chalk.bold(String(params.market).toUpperCase())} ${ARROW} ${sideColored} ${chalk.dim(`${params.leverage}x`)}` },
+        { label: 'Entry', value: chalk.bold(formatPrice(result.entryPrice)) },
+        { label: 'Size', value: chalk.bold(formatUsd(result.sizeUsd)) },
+        { label: 'Collateral', value: formatUsd(params.collateral as number) },
+        { label: 'Liquidation', value: liqStr },
+        { label: 'TX', value: `${chalk.dim(shortSig(result.txSignature))}  ${chalk.dim(solscanTx(result.txSignature, client.network))}` },
+      ],
+    });
     return {
       success: true,
-      message: [
-        '',
-        chalk.green('  Position Opened'),
-        chalk.dim('  ─────────────────'),
-        `  Market:            ${chalk.cyan(String(params.market).toUpperCase())} ${chalk.bold(String(params.side))} ${chalk.dim(`${params.leverage}x`)}`,
-        `  Entry Price:       ${formatPrice(result.entryPrice)}`,
-        `  Size:              ${formatUsd(result.sizeUsd)}`,
-        `  Collateral:        ${formatUsd(params.collateral as number)}`,
-        `  Liquidation Price: ${liqStr}`,
-        `  TX: ${chalk.dim(shortSig(result.txSignature))}  ${chalk.dim(solscanTx(result.txSignature, client.network))}`,
-        '',
-      ].join('\n'),
+      message: '\n' + card + '\n',
       txSignature: result.txSignature,
       data: { result },
     };
@@ -604,17 +608,20 @@ export const magicClose: ToolDefinition = {
       params.receiveToken as string | undefined,
     );
     const pnlColor = result.pnl >= 0 ? chalk.green : chalk.red;
+    const sideColored = params.side === 'short' ? chalk.red.bold(String(params.side).toUpperCase()) : chalk.green.bold(String(params.side).toUpperCase());
+    const card = renderCard({
+      title: `${SPARK} ${chalk.green.bold('Position Closed')} ${BOLT}`,
+      width: 64,
+      border: chalk.cyanBright,
+      rows: [
+        { label: 'Market', value: `${chalk.bold(String(params.market).toUpperCase())} ${ARROW} ${sideColored}` },
+        { label: 'PnL', value: chalk.bold(pnlColor(formatUsd(result.pnl))) },
+        { label: 'TX', value: `${chalk.dim(shortSig(result.txSignature))}  ${chalk.dim(solscanTx(result.txSignature, client.network))}` },
+      ],
+    });
     return {
       success: true,
-      message: [
-        '',
-        chalk.green('  Position Closed'),
-        chalk.dim('  ─────────────────'),
-        `  Market:            ${chalk.cyan(String(params.market).toUpperCase())} ${chalk.bold(String(params.side))}`,
-        `  PnL:               ${pnlColor(formatUsd(result.pnl))}`,
-        `  TX: ${chalk.dim(shortSig(result.txSignature))}  ${chalk.dim(solscanTx(result.txSignature, client.network))}`,
-        '',
-      ].join('\n'),
+      message: '\n' + card + '\n',
       txSignature: result.txSignature,
       data: { result },
     };
@@ -742,37 +749,33 @@ export const magicVault: ToolDefinition = {
       };
     }
 
-    // Pad raw strings BEFORE chalk styling — chalk wraps text with ANSI
-    // escape codes that count toward .padEnd's length and break alignment.
-    const COL_TOK = 8;
-    const COL_DEP = 18;
-    const COL_LOCK = 18;
-    const lines: string[] = ['', chalk.cyan('  💰 Vault'), sep];
-    lines.push(
-      '  ' +
-        chalk.dim('Token'.padEnd(COL_TOK)) +
-        chalk.dim('Deposits'.padEnd(COL_DEP)) +
-        chalk.dim('Locked'.padEnd(COL_LOCK)) +
-        chalk.dim('Available'),
-    );
+    // Magic vault rendered with bar charts inside a bordered card.
     let totalAvailUsd = 0;
+    const rows: Array<{ label: string; value: string }> = [];
     for (const [sym, bal] of balances) {
       const dec = bal.decimals;
       const fmt = (n: number) => (dec === 6 ? n.toFixed(2) : n.toFixed(6));
-      const locked = bal.debits - bal.pendingCredits;
+      const locked = Math.max(bal.debits - bal.pendingCredits, 0);
       const availColor = bal.available > 0.01 ? chalk.green : chalk.red;
-      lines.push(
-        '  ' +
-          chalk.bold(sym.padEnd(COL_TOK)) +
-          fmt(bal.deposits).padEnd(COL_DEP) +
-          fmt(Math.max(locked, 0)).padEnd(COL_LOCK) +
-          availColor(fmt(bal.available)),
-      );
+      const utilization = bar(locked, bal.deposits, 14);
+      rows.push({
+        label: chalk.bold(sym),
+        value: `${utilization}  ${chalk.dim('avail')} ${availColor(fmt(bal.available))} ${chalk.dim('/')} ${chalk.dim('total')} ${fmt(bal.deposits)}`,
+      });
       const isStable = client.poolConfig.tokens.find((t) => t.symbol === sym)?.isStable;
       if (isStable) totalAvailUsd += bal.available;
     }
-    lines.push(sep);
-    lines.push(`  ${chalk.dim('Available stable')}  ${chalk.bold(formatUsd(totalAvailUsd))}`);
+    rows.push({ label: '', value: '' });
+    rows.push({
+      label: chalk.dim('Stable USD'),
+      value: chalk.bold(formatUsd(totalAvailUsd)) + chalk.dim(' available across stables'),
+    });
+    const lines = ['', renderCard({
+      title: `${SPARK} ${gradient('VAULT')} ${BOLT}`,
+      width: 72,
+      border: chalk.magentaBright,
+      rows,
+    }), ''];
     lines.push('');
     return { success: true, message: lines.join('\n'), data: { balances: Object.fromEntries(balances) } };
   },
