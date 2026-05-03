@@ -2677,8 +2677,11 @@ export class FlashTerminal {
         return;
       }
       // ─── Preview + Y/N confirm before signing ────────────────────────
-      // Set MAGIC_AUTO_CONFIRM=true to skip (for power users / scripted flow).
-      const autoConfirm = (process.env.MAGIC_AUTO_CONFIRM ?? 'false').toLowerCase() === 'true';
+      // OFF by default — magic mode is built for speed; the preview adds 1-2s
+      // of human read time. Re-enable with MAGIC_AUTO_CONFIRM=false (note the
+      // double-negative: "auto-confirm true" = skip prompt = old default;
+      // "auto-confirm false" = show prompt + Y/N).
+      const autoConfirm = (process.env.MAGIC_AUTO_CONFIRM ?? 'true').toLowerCase() !== 'false';
       const needsConfirm = !autoConfirm && [
         'magicOpen', 'magicClose', 'magicAddCollateral', 'magicRemoveCollateral',
         'magicReverse', 'magicPartialClose', 'magicIncrease', 'magicTriggerOrder',
