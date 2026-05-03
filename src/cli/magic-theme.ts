@@ -112,6 +112,10 @@ export interface CardOpts {
 
 /** Inner card width (visible). Exterior = inner + 4 (left bar + spaces). */
 const INNER = 70;
+/** Width of the label column in body rows. */
+const LABEL_W = 14;
+/** Spacing between left + right columns when rendering in 2-column mode. */
+const COL_GAP = 4;
 
 /**
  * Premium card with vertical accent bar, status header, 2-column body,
@@ -140,44 +144,45 @@ export function renderCard(opts: CardOpts): string {
   lines.push(`  ${bar}  ${headerLeft}${' '.repeat(Math.max(headerPad, 2))}${headerRight}`);
   lines.push(`  ${bar}`);
 
-  // Body — 2 columns when ≥ 4 rows, else single column
+  // Body — 2 columns when ≥ 4 rows, else single column.
+  // Tighter layout: pad LEFT half to a fixed column then concat the right half
+  // without trailing whitespace so the row ends at the actual content.
   if (opts.rows.length >= 4) {
-    const colWidth = Math.floor(INNER / 2);
-    const labelW = 14;
-    const renderHalf = (r: KV | undefined): string => {
-      if (!r) return ' '.repeat(colWidth);
-      const labelStr = chalk.dim(r.label.padEnd(labelW));
-      const valueStr = r.value;
-      return pad(labelStr + valueStr, colWidth);
+    const halfWidth = Math.floor((INNER - COL_GAP) / 2);
+    const renderCell = (r: KV | undefined): string => {
+      if (!r) return '';
+      return chalk.dim(r.label.padEnd(LABEL_W)) + r.value;
     };
     for (let i = 0; i < opts.rows.length; i += 2) {
-      const left = renderHalf(opts.rows[i]);
-      const right = renderHalf(opts.rows[i + 1]);
-      lines.push(`  ${bar}  ${left}${right}`);
+      const left = renderCell(opts.rows[i]);
+      const right = renderCell(opts.rows[i + 1]);
+      const leftPadded = pad(left, halfWidth + COL_GAP);
+      lines.push(`  ${bar}  ${leftPadded}${right}`);
     }
   } else {
-    const labelW = 14;
     for (const r of opts.rows) {
-      const labelStr = chalk.dim(r.label.padEnd(labelW));
+      const labelStr = chalk.dim(r.label.padEnd(LABEL_W));
       lines.push(`  ${bar}  ${labelStr}${r.value}`);
     }
   }
 
-  // Footer
-  if (opts.sig || opts.url || opts.latencyMs !== undefined) {
+  // Footer — sig + latency on one line; URL on its own line below the card
+  // (a copy/paste-safe clickable link, never truncated mid-param).
+  if (opts.sig || opts.latencyMs !== undefined) {
     lines.push(`  ${bar}`);
     const footerParts: string[] = [];
     if (opts.sig) footerParts.push(`${DIAMOND}  ${chalk.dim(opts.sig)}`);
     if (opts.latencyMs !== undefined) footerParts.push(latencyPill(opts.latencyMs));
-    if (footerParts.length > 0) {
-      lines.push(`  ${bar}  ${footerParts.join('   ')}`);
-    }
-    if (opts.url) {
-      lines.push(`  ${bar}     ${chalk.dim(compactUrl(opts.url, INNER - 6))}`);
-    }
+    lines.push(`  ${bar}  ${footerParts.join('   ')}`);
   }
 
   lines.push('');
+  if (opts.url) {
+    // Print the full URL on its own line outside the card frame so terminal
+    // hyperlink parsers (iTerm, Kitty, modern Terminal.app) make it clickable.
+    lines.push(`     ${chalk.cyan('→')} ${chalk.dim(opts.url)}`);
+    lines.push('');
+  }
   return lines.join('\n');
 }
 

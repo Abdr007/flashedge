@@ -583,13 +583,45 @@ export class MagicTradeClient implements IFlashClient {
       //     its market lookup) and the user's pay token as `receivingSymbol`.
       //   - openPosition takes (target, lock, collateral=user-pay-token).
       //
-      // Reuse the previewOpen quote if it's <5s old and matches our params —
-      // saves ~100ms on the hot path after the user's y/n confirm.
+      // Hot-path speed: try sources for size in order
+      //   1. Recent preview quote cache (5s) — same params as a just-shown preview
+      //   2. Oracle cache (3s) — compute size locally from cached price
+      //   3. Live SDK getOpenPositionQuote — ~100ms simulate against ER
       const quoteCacheKey = this.quoteKey(targetSymbol, side, collateralAmount, leverage, collateralSymbol);
       const cachedQuote = this.lastQuoteCache;
-      const quote = (cachedQuote && cachedQuote.key === quoteCacheKey && Date.now() - cachedQuote.ts < 5000)
-        ? cachedQuote.quote
-        : (await this.sdk.getOpenPositionQuote(
+      const cachedOracle = this.cachedOraclePrice(targetSymbol);
+      const targetCustody = this.poolConfig.getCustodyFromSymbol(targetSymbol);
+
+      type Quote = NonNullable<typeof cachedQuote>['quote'];
+      let quote: Quote;
+
+      if (cachedQuote && cachedQuote.key === quoteCacheKey && Date.now() - cachedQuote.ts < 5000) {
+        quote = cachedQuote.quote;
+      } else if (cachedOracle && cachedOracle > 0) {
+        // Synthesize a quote locally from the cached oracle. Saves the
+        // ~100ms simulate. Fees subtracted at the standard 4 bps.
+        const sizeRaw = new BN(Math.floor((sizeUsd / cachedOracle) * 10 ** targetCustody.decimals));
+        const sizeUsdRaw = new BN(Math.floor(sizeUsd * 1_000_000));
+        const collUsdRaw = new BN(Math.floor(collateralAmount * 1_000_000));
+        const feeUsdRaw = new BN(Math.floor(sizeUsd * 0.0004 * 1_000_000)); // ~4 bps
+        const oracleRaw = new BN(Math.floor(cachedOracle * 1e8));
+        // Crude liq estimate: long → entry × (1 - 1/lev × 0.95); short → entry × (1 + 1/lev × 0.95)
+        const liqUsd = side === TradeSide.Long
+          ? cachedOracle * (1 - (1 / leverage) * 0.95)
+          : cachedOracle * (1 + (1 / leverage) * 0.95);
+        const liqRaw = new BN(Math.floor(liqUsd * 1e8));
+        quote = {
+          collateralAmount: collateralRaw,
+          sizeAmount: sizeRaw,
+          entryPrice: { price: oracleRaw, exponent: -8 },
+          liquidationPrice: { price: liqRaw, exponent: -8 },
+          sizeUsd: sizeUsdRaw,
+          collateralUsd: collUsdRaw,
+          entryFeeUsd: feeUsdRaw,
+          swapRequired: collateralSymbol !== lockSymbol,
+        };
+      } else {
+        quote = (await this.sdk.getOpenPositionQuote(
             targetSymbol,
             lockSymbol,
             sdkSide,
@@ -601,7 +633,8 @@ export class MagicTradeClient implements IFlashClient {
             null,
             null,
             this.basketPda,
-          )) as unknown as NonNullable<typeof cachedQuote>['quote'];
+          )) as unknown as Quote;
+      }
       const collateralRawForIx = quote.collateralAmount as BN;
       const sizeRawForIx = quote.sizeAmount as BN;
       const entryPriceForReturn = priceToNumber(quote.entryPrice as { price: BN; exponent: number });

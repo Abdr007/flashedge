@@ -1215,15 +1215,12 @@ export class FlashTerminal {
     // Header — magic mode gets the unique gradient banner; live/sim keep the badge.
     console.log('');
     if (isMagic) {
-      const { magicBanner, SPARK, BOLT, gradient } = await import('./magic-theme.js');
+      const { magicBanner } = await import('./magic-theme.js');
       process.stdout.write(magicBanner());
       if (isMagicDevnet) {
         console.log(`  ${chalk.red('[ DEVNET ]')}  ${chalk.dim('— testnet pool, free SOL faucet')}`);
         console.log('');
       }
-      console.log(`  ${SPARK} ${gradient('FLASH TERMINAL')} ${SPARK}  ${BOLT} ${chalk.dim('v2 · ER routing live')}`);
-      console.log(`  ${theme.separator(50)}`);
-      console.log('');
     } else {
       console.log(`  ${theme.accentBold('FLASH TERMINAL')}`);
       console.log(`  ${theme.separator(32)}`);
