@@ -192,6 +192,141 @@ interface IntelligenceData {
   dominantRegime?: string;
 }
 
+// ─── Magic-mode parser (uses PoolConfig as truth source) ──────────────────
+
+/** Cached symbol set + aliases for the active magic pool — built once per session. */
+let _magicSymCache: { key: string; symbols: Set<string>; aliases: Map<string, string> } | null = null;
+
+function getMagicSymbolSet(network: string, pool: string): { symbols: Set<string>; aliases: Map<string, string> } {
+  const key = `${network}:${pool}`;
+  if (_magicSymCache && _magicSymCache.key === key) return _magicSymCache;
+  const symbols = new Set<string>();
+  const aliases = new Map<string, string>();
+  try {
+    // Lazy-import the SDK so the parser works without forcing the SDK on
+    // non-magic users at import time.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { PoolConfig } = require('@flash_trade/magic-trade-client') as { PoolConfig: { fromIdsByName: (n: string, c: 'mainnet-beta' | 'devnet') => { custodies: Array<{ symbol: string }> } } };
+    const cluster = network === 'devnet' ? 'devnet' : 'mainnet-beta';
+    const p = PoolConfig.fromIdsByName(pool, cluster);
+    for (const c of p.custodies) symbols.add(c.symbol.toUpperCase());
+  } catch {
+    /* fall through with empty set; live-mode parser will still try */
+  }
+  // Hand-curated aliases for symbols that have natural names.
+  const ALIAS_MAP: Record<string, string[]> = {
+    SOL: ['solana'],
+    BTC: ['bitcoin'],
+    ETH: ['ethereum', 'ether'],
+    BNB: ['binance'],
+    MON: ['monad'],
+    SUI: ['sui'],
+    HYPE: ['hyperliquid'],
+    ZEC: ['zcash'],
+    SPY: ['sp500', 's&p', 's&p500'],
+    AAPL: ['apple'],
+    TSLA: ['tesla'],
+    NVDA: ['nvidia'],
+    AMZN: ['amazon'],
+    INTC: ['intel'],
+    LLY: ['lilly'],
+    TSM: ['tsmc', 'taiwan'],
+    TXN: ['texas'],
+    EUR: ['euro'],
+    GBP: ['pound', 'sterling'],
+    USDJPY: ['jpy', 'yen', 'usdjpy'],
+    USDCNH: ['cnh', 'yuan', 'usdcnh'],
+    XAU: ['gold'],
+    XAG: ['silver'],
+    CRUDEOIL: ['crude', 'oil', 'crudeoil'],
+    NATGAS: ['natgas', 'gas', 'naturalgas'],
+    COPPER: ['copper'],
+  };
+  for (const [canon, names] of Object.entries(ALIAS_MAP)) {
+    if (!symbols.has(canon)) continue;
+    for (const n of names) aliases.set(n.toLowerCase(), canon);
+  }
+  _magicSymCache = { key, symbols, aliases };
+  return _magicSymCache;
+}
+
+/**
+ * Parse `<symbol> <side> <collateral> <leverage>` (in any order) using the
+ * magic pool's symbol set as truth source. Strips noise words (dollars,
+ * usd, usdc, with, for, etc.). Returns null when the input lacks one of
+ * the four required fields — caller should fall back to live-mode parser.
+ */
+function parseMagicOpenArgs(
+  argString: string,
+  network: string,
+  pool: string,
+): { market: string; side: 'long' | 'short'; collateral: number; leverage: number } | null {
+  const { symbols, aliases } = getMagicSymbolSet(network, pool);
+  const cleaned = argString
+    .toLowerCase()
+    .replace(/\$(\d)/g, '$1') // "$10" → "10" (we'll re-detect dollar-prefix tokens separately)
+    .replace(/\b(?:with|for|on|at|to|in|of|using|and|the|a|an|my|position|collateral|dollars?|bucks?|usd|usdc|leverage|lev)\b/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const tokens = cleaned.split(/\s+/);
+
+  let side: 'long' | 'short' | undefined;
+  let leverage: number | undefined;
+  let collateral: number | undefined;
+  let market: string | undefined;
+  const numbers: number[] = [];
+
+  for (const tok of tokens) {
+    if (tok === 'long' || tok === 'short' || tok === 'buy' || tok === 'sell') {
+      side = tok === 'short' || tok === 'sell' ? 'short' : 'long';
+      continue;
+    }
+    // Leverage: "2x", "5.5x"
+    const levM = tok.match(/^(\d+(?:\.\d+)?)x$/);
+    if (levM) {
+      leverage = parseFloat(levM[1]);
+      continue;
+    }
+    // Bare number → collect; we'll disambiguate after.
+    if (/^\d+(?:\.\d+)?$/.test(tok)) {
+      numbers.push(parseFloat(tok));
+      continue;
+    }
+    // Symbol — exact match against magic pool, then alias map.
+    const upper = tok.toUpperCase();
+    if (symbols.has(upper)) {
+      market = upper;
+      continue;
+    }
+    const aliased = aliases.get(tok);
+    if (aliased) {
+      market = aliased;
+      continue;
+    }
+  }
+
+  // Resolve numbers → collateral / leverage.
+  if (numbers.length === 1 && leverage !== undefined) {
+    collateral = numbers[0];
+  } else if (numbers.length === 1 && leverage === undefined) {
+    // Ambiguous — refuse, let v1 parser try (may have a default leverage).
+    return null;
+  } else if (numbers.length >= 2) {
+    if (leverage === undefined) {
+      // Take the smaller as leverage, larger as collateral (conventional).
+      const sorted = [...numbers].sort((a, b) => a - b);
+      leverage = sorted[0];
+      collateral = sorted[1];
+    } else {
+      collateral = numbers[0];
+    }
+  }
+
+  if (!market || !side || !Number.isFinite(collateral) || !Number.isFinite(leverage)) return null;
+  if ((collateral as number) <= 0 || (leverage as number) <= 0) return null;
+  return { market, side, collateral: collateral as number, leverage: leverage as number };
+}
+
 export class FlashTerminal {
   private config: FlashConfig;
   private interpreter: OfflineInterpreter;
@@ -2480,15 +2615,18 @@ export class FlashTerminal {
             return { tool: 'magicWithdraw', params: { token: parts[1], amount } };
           }
           case 'open': {
-            // Defer to v1's flexible parser so all forms work:
-            //   magic open SOL long 10 2
-            //   magic open sol long 2x $10
-            //   magic open 5x short btc $50
-            //   magic open SOL long 10 dollars 2x
+            // Magic-aware parser — uses the magic pool's custodies as the
+            // market truth source so MON, SUI, AAPL, etc. resolve cleanly
+            // (live-mode's fuzzy resolver would map 'mon' → 'BONK').
             const argString = parts.slice(1).join(' ');
+            const magicParsed = parseMagicOpenArgs(argString, this.config?.magicNetwork ?? 'mainnet-beta', this.config?.magicPoolName ?? 'Pool.0');
+            if (magicParsed) return { tool: 'magicOpen', params: magicParsed };
+
+            // Fall back to v1's localParse for any phrasings the magic
+            // parser missed (uses fuzzy, may misroute exotic symbols).
             const parsed = localParse(`open ${argString}`);
             if (!parsed || parsed.action !== ActionType.OpenPosition) {
-              return { error: 'usage: magic open <symbol> <long|short> <collateral_usd> <leverage>  (e.g. `magic open SOL long 10 2x`)' };
+              return { error: 'usage: magic open <symbol> <long|short> <collateral_usd> <leverage>  (e.g. `magic open MON long 5 2x`)' };
             }
             const p = parsed as { market: string; side: TradeSide; collateral: number; leverage: number };
             return {
@@ -2498,7 +2636,6 @@ export class FlashTerminal {
                 side: String(p.side),
                 collateral: Number(p.collateral),
                 leverage: Number(p.leverage),
-                // collateralToken stays default USDC unless explicitly typed as a separate trailing token; v1 parser strips it
               },
             };
           }
@@ -3725,6 +3862,7 @@ export class FlashTerminal {
    * Live magic-mode portfolio loop. Refreshes every 1s with cursor-home
    * redraw so the table stays put. Press Enter or any key to exit.
    */
+  private static _magicSymbolCache: { network: string; pool: string; symbols: Set<string>; aliases: Map<string, string> } | null = null;
   private async runMagicWatch(): Promise<void> {
     const { Connection } = await import('@solana/web3.js');
     const { MagicTradeClient } = await import('../client/magic-client.js');
