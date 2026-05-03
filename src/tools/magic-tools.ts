@@ -21,7 +21,7 @@ import { formatPrice, formatUsd } from '../utils/format.js';
 import { readMagicHistory, recordMagicTrade } from '../security/magic-history.js';
 import { startErHealthMonitor, getErHealthMonitor } from '../monitor/magic-er-health.js';
 import { startMagicAlerts, stopMagicAlerts, getMagicAlerts } from '../monitor/magic-alerts.js';
-import { renderCard, bar, SPARK, BOLT, ARROW, gradient } from '../cli/magic-theme.js';
+import { renderCard, bar, marketHeader } from '../cli/magic-theme.js';
 
 /** Truncate a long base58 string for display: "5oZL8a…m9KJ". */
 function shortSig(s: string): string {
@@ -569,23 +569,22 @@ export const magicOpen: ToolDefinition = {
       params.collateralToken as string | undefined,
     );
     const liqStr = result.liquidationPrice && result.liquidationPrice > 0 ? chalk.yellow(formatPrice(result.liquidationPrice)) : chalk.dim('N/A');
-    const sideColored = params.side === 'short' ? chalk.red.bold(String(params.side).toUpperCase()) : chalk.green.bold(String(params.side).toUpperCase());
     const card = renderCard({
-      title: `${SPARK} ${chalk.green.bold('Position Opened')} ${BOLT}`,
-      width: 64,
-      border: chalk.cyanBright,
+      status: 'Position Opened',
+      tone: 'open',
+      subtitle: marketHeader(String(params.market), String(params.side), params.leverage as number),
       rows: [
-        { label: 'Market', value: `${chalk.bold(String(params.market).toUpperCase())} ${ARROW} ${sideColored} ${chalk.dim(`${params.leverage}x`)}` },
         { label: 'Entry', value: chalk.bold(formatPrice(result.entryPrice)) },
+        { label: 'Liquidation', value: liqStr },
         { label: 'Size', value: chalk.bold(formatUsd(result.sizeUsd)) },
         { label: 'Collateral', value: formatUsd(params.collateral as number) },
-        { label: 'Liquidation', value: liqStr },
-        { label: 'TX', value: `${chalk.dim(shortSig(result.txSignature))}  ${chalk.dim(solscanTx(result.txSignature, client.network))}` },
       ],
+      sig: shortSig(result.txSignature),
+      url: solscanTx(result.txSignature, client.network),
     });
     return {
       success: true,
-      message: '\n' + card + '\n',
+      message: card,
       txSignature: result.txSignature,
       data: { result },
     };
@@ -608,20 +607,17 @@ export const magicClose: ToolDefinition = {
       params.receiveToken as string | undefined,
     );
     const pnlColor = result.pnl >= 0 ? chalk.green : chalk.red;
-    const sideColored = params.side === 'short' ? chalk.red.bold(String(params.side).toUpperCase()) : chalk.green.bold(String(params.side).toUpperCase());
     const card = renderCard({
-      title: `${SPARK} ${chalk.green.bold('Position Closed')} ${BOLT}`,
-      width: 64,
-      border: chalk.cyanBright,
-      rows: [
-        { label: 'Market', value: `${chalk.bold(String(params.market).toUpperCase())} ${ARROW} ${sideColored}` },
-        { label: 'PnL', value: chalk.bold(pnlColor(formatUsd(result.pnl))) },
-        { label: 'TX', value: `${chalk.dim(shortSig(result.txSignature))}  ${chalk.dim(solscanTx(result.txSignature, client.network))}` },
-      ],
+      status: 'Position Closed',
+      tone: 'close',
+      subtitle: marketHeader(String(params.market), String(params.side)),
+      rows: [{ label: 'PnL', value: chalk.bold(pnlColor(formatUsd(result.pnl))) }],
+      sig: shortSig(result.txSignature),
+      url: solscanTx(result.txSignature, client.network),
     });
     return {
       success: true,
-      message: '\n' + card + '\n',
+      message: card,
       txSignature: result.txSignature,
       data: { result },
     };
@@ -770,12 +766,14 @@ export const magicVault: ToolDefinition = {
       label: chalk.dim('Stable USD'),
       value: chalk.bold(formatUsd(totalAvailUsd)) + chalk.dim(' available across stables'),
     });
-    const lines = ['', renderCard({
-      title: `${SPARK} ${gradient('VAULT')} ${BOLT}`,
-      width: 72,
-      border: chalk.magentaBright,
-      rows,
-    }), ''];
+    const lines = [
+      renderCard({
+        status: 'Vault',
+        tone: 'info',
+        subtitle: chalk.dim(`${balances.size} tokens · ${client.network}`),
+        rows,
+      }),
+    ];
     lines.push('');
     return { success: true, message: lines.join('\n'), data: { balances: Object.fromEntries(balances) } };
   },

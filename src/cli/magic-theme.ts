@@ -1,160 +1,231 @@
 /**
- * Magic-mode visual theme — gradient text, double-bordered cards,
- * sparkle accents. Used by the trade-card renderers and welcome banner.
+ * Magic-mode visual theme — premium minimalism.
  *
- * Self-contained: no external deps beyond chalk so it works in any TTY
- * that supports basic ANSI colors. Falls back gracefully on dumb terminals.
+ * Visual language:
+ *   - Vertical accent bar (▌) on the LEFT of every card, color-coded:
+ *       green   = open position / positive PnL / safe
+ *       red     = close / negative PnL / critical risk
+ *       cyan    = neutral info / status
+ *       yellow  = warning / pending
+ *   - Status header in bold caps, right-aligned subtitle (market, side, lev).
+ *   - Body rendered as a two-column grid where space allows.
+ *   - Footer: sig + URL + latency, separated by sigils.
+ *   - Single accent color (cyan), no rainbow gradients.
  */
 
 import chalk from 'chalk';
 
-/** Gradient stops cycling through cyan → magenta → blue → cyan. */
-const GRADIENT = [
-  chalk.cyan,
-  chalk.cyanBright,
-  chalk.magentaBright,
-  chalk.magenta,
-  chalk.blueBright,
-  chalk.blue,
-];
-
-/** Apply a gradient across a string by character. */
-export function gradient(text: string): string {
-  let out = '';
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i];
-    const color = GRADIENT[i % GRADIENT.length];
-    out += ch === ' ' ? ch : color(ch);
-  }
-  return out;
-}
-
-/** Sparkles + lightning motifs — fixed-width so layout stays stable. */
-export const SPARK = chalk.cyanBright('✦');
-export const BOLT = chalk.yellowBright('⚡');
-export const DIAMOND = chalk.magentaBright('◆');
+/** Sigils — used sparingly. */
+export const SPARK = chalk.cyan('✦');
+export const BOLT = chalk.cyan('⚡');
+export const DIAMOND = chalk.cyan('◆');
 export const ARROW = chalk.dim('→');
 export const DOT = chalk.dim('·');
 
-/** Box-drawing characters for the magic card style. */
-const BOX = {
-  tl: '╭',
-  tr: '╮',
-  bl: '╰',
-  br: '╯',
-  h: '─',
-  v: '│',
-  ml: '├',
-  mr: '┤',
-} as const;
-
 /** Visible-character length (strips ANSI escapes for width math). */
-function visibleLen(s: string): number {
+export function vlen(s: string): number {
   // eslint-disable-next-line no-control-regex
   return s.replace(/\x1b\[[0-9;]*m/g, '').length;
 }
 
 /** Pad to exact visible width (handling ANSI). */
-function padVisible(s: string, target: number): string {
-  const need = target - visibleLen(s);
+function pad(s: string, target: number): string {
+  const need = target - vlen(s);
   return need > 0 ? s + ' '.repeat(need) : s;
 }
 
-export interface CardLine {
-  /** Row label (left column). */
-  label: string;
-  /** Row value (right column). Pre-colored. */
-  value: string;
-}
-
-export interface CardOpts {
-  /** Header text — pre-styled (caller picks color). */
-  title: string;
-  /** Optional sub-line under the title (e.g. tx sig). */
-  subtitle?: string;
-  /** Body rows. */
-  rows: CardLine[];
-  /** Inner content width. Default 40. */
-  width?: number;
-  /** Border color. Default chalk.cyanBright. */
-  border?: (s: string) => string;
+/** Truncate string with ellipsis to fit visible width. */
+export function truncate(s: string, max: number): string {
+  return vlen(s) <= max ? s : s.slice(0, Math.max(1, max - 1)) + '…';
 }
 
 /**
- * Render a trade-card-style box.
- *
- * ╭─ ✦ Position Opened ─────────────────╮
- * │  Market           SOL long 2x       │
- * │  Entry            $84.20            │
- * │  Size             $20.00            │
- * ╰──────────────────────────────────────╯
+ * Format a tx URL for the footer — truncate the middle so the host + tail
+ * are still visible. `https://explorer.solana.com/tx/abc…xyz?cluster=…`
  */
-export function renderCard(opts: CardOpts): string {
-  const width = opts.width ?? 42;
-  const border = opts.border ?? chalk.cyanBright;
-  const lines: string[] = [];
-
-  // Top border with title inline
-  const titlePad = ` ${opts.title} `;
-  const titleVisible = visibleLen(titlePad);
-  const remaining = width - titleVisible - 2;
-  const leftDashes = 2;
-  const rightDashes = Math.max(remaining - leftDashes, 1);
-  lines.push(
-    border(BOX.tl + BOX.h.repeat(leftDashes)) +
-      titlePad +
-      border(BOX.h.repeat(rightDashes) + BOX.tr),
-  );
-
-  if (opts.subtitle) {
-    const sub = `  ${opts.subtitle}`;
-    lines.push(border(BOX.v) + padVisible(sub, width) + border(BOX.v));
-  }
-
-  // Body rows: "  label    value" with label left-padded to 14 cols
-  for (const row of opts.rows) {
-    const label = chalk.dim(row.label.padEnd(14));
-    const content = `  ${label}${row.value}`;
-    lines.push(border(BOX.v) + padVisible(content, width) + border(BOX.v));
-  }
-
-  // Bottom border
-  lines.push(border(BOX.bl + BOX.h.repeat(width) + BOX.br));
-  return lines.join('\n');
+export function compactUrl(url: string, max = 60): string {
+  if (url.length <= max) return url;
+  // Keep host + path prefix, …, tail
+  const head = url.slice(0, Math.floor(max * 0.55));
+  const tail = url.slice(-Math.floor(max * 0.35));
+  return `${head}…${tail}`;
 }
 
-/**
- * Color-bar utilization renderer. Shows a horizontal bar with `value/max` filled.
- * Used for vault locked-vs-deposit and liq-distance indicators.
- *
- * Returns: [▰▰▰▰▱▱▱▱▱▱] 40%
- */
-export function bar(value: number, max: number, width = 12): string {
-  const ratio = Math.max(0, Math.min(1, max > 0 ? value / max : 0));
-  const filled = Math.round(ratio * width);
-  const bars = '▰'.repeat(filled) + '▱'.repeat(width - filled);
-  let color = chalk.green;
-  if (ratio > 0.85) color = chalk.red;
-  else if (ratio > 0.6) color = chalk.yellow;
-  const pct = (ratio * 100).toFixed(0).padStart(3) + '%';
-  return color(bars) + ' ' + chalk.dim(pct);
+/** Direction label: green LONG / red SHORT, bold. */
+export function sideLabel(side: string): string {
+  return side === 'short' ? chalk.red.bold('SHORT') : chalk.green.bold('LONG');
 }
 
-/** Centered welcome banner — gradient MAGIC TRADING wordmark + tagline. */
-export function magicBanner(): string {
-  const lines: string[] = [];
-  lines.push('');
-  lines.push(`  ${SPARK}  ${gradient('M A G I C   T R A D I N G')}  ${SPARK}`);
-  lines.push(`     ${chalk.dim('Flash Magic Trade · MagicBlock ER · sub-second confirms')}`);
-  lines.push('');
-  return lines.join('\n');
+/** Compact market header: "SOL · LONG · 2x" with bold + colors. */
+export function marketHeader(symbol: string, side: string, leverage?: number): string {
+  const parts = [chalk.white.bold(symbol.toUpperCase()), sideLabel(side)];
+  if (leverage) parts.push(chalk.dim(`${leverage}x`));
+  return parts.join(' ' + DOT + ' ');
 }
 
-/** Latency pill — colored ⚡ + time formatted with subtle border. */
+/** Latency pill — green/yellow/red ⚡ + time. */
 export function latencyPill(ms: number): string {
   const seconds = ms / 1000;
   const text = seconds < 1 ? `${seconds.toFixed(2)}s` : `${seconds.toFixed(1)}s`;
   if (ms < 500) return `${chalk.green('⚡')} ${chalk.green(text)}`;
   if (ms < 2000) return `${chalk.yellow('⚡')} ${chalk.yellow(text)}`;
   return `${chalk.red('⚡')} ${chalk.red(text)}`;
+}
+
+/** Horizontal utilization bar — █ filled, · empty, color-graded by ratio. */
+export function bar(value: number, max: number, width = 18): string {
+  const ratio = Math.max(0, Math.min(1, max > 0 ? value / max : 0));
+  const filled = Math.round(ratio * width);
+  let color = chalk.green;
+  if (ratio > 0.85) color = chalk.red;
+  else if (ratio > 0.6) color = chalk.yellow;
+  return color('█'.repeat(filled)) + chalk.dim('·'.repeat(width - filled));
+}
+
+export type Tone = 'open' | 'close' | 'info' | 'warn' | 'error';
+const TONE_COLOR = {
+  open: chalk.green,
+  close: chalk.cyan,
+  info: chalk.cyan,
+  warn: chalk.yellow,
+  error: chalk.red,
+} as const;
+
+export interface KV { label: string; value: string }
+
+export interface CardOpts {
+  /** Action verb shown bold in the header — e.g. "POSITION OPENED". */
+  status: string;
+  /** Right-aligned subtitle (typically marketHeader output). */
+  subtitle?: string;
+  /** Body rows — rendered in 2 columns when count ≥ 4. */
+  rows: KV[];
+  /** Optional short-form tx signature. */
+  sig?: string;
+  /** Optional tx URL — auto-truncated to fit. */
+  url?: string;
+  /** Latency in ms — renders as a pill in the footer. */
+  latencyMs?: number;
+  /** Color tone — drives the left accent bar + header color. Default 'info'. */
+  tone?: Tone;
+}
+
+/** Inner card width (visible). Exterior = inner + 4 (left bar + spaces). */
+const INNER = 70;
+
+/**
+ * Premium card with vertical accent bar, status header, 2-column body,
+ * and a sig/url/latency footer.
+ *
+ *   ▌  POSITION OPENED                              SOL · LONG · 2x
+ *   ▌
+ *   ▌  Entry           $84.31     Liquidation        $42.23
+ *   ▌  Size            $9.99      Distance to liq    50.0%
+ *   ▌  Collateral      $5.00      Fee                $0.04
+ *   ▌
+ *   ▌  ◆  4bMwpk…JmfV   ⚡ 0.34s
+ *   ▌     https://explorer.solana.com/tx/abc…xyz
+ *
+ */
+export function renderCard(opts: CardOpts): string {
+  const tone = opts.tone ?? 'info';
+  const tc = TONE_COLOR[tone];
+  const bar = tc('▌');
+  const lines: string[] = [];
+
+  const headerLeft = tc.bold(opts.status.toUpperCase());
+  const headerRight = opts.subtitle ?? '';
+  const headerPad = INNER - vlen(headerLeft) - vlen(headerRight);
+  lines.push('');
+  lines.push(`  ${bar}  ${headerLeft}${' '.repeat(Math.max(headerPad, 2))}${headerRight}`);
+  lines.push(`  ${bar}`);
+
+  // Body — 2 columns when ≥ 4 rows, else single column
+  if (opts.rows.length >= 4) {
+    const colWidth = Math.floor(INNER / 2);
+    const labelW = 14;
+    const renderHalf = (r: KV | undefined): string => {
+      if (!r) return ' '.repeat(colWidth);
+      const labelStr = chalk.dim(r.label.padEnd(labelW));
+      const valueStr = r.value;
+      return pad(labelStr + valueStr, colWidth);
+    };
+    for (let i = 0; i < opts.rows.length; i += 2) {
+      const left = renderHalf(opts.rows[i]);
+      const right = renderHalf(opts.rows[i + 1]);
+      lines.push(`  ${bar}  ${left}${right}`);
+    }
+  } else {
+    const labelW = 14;
+    for (const r of opts.rows) {
+      const labelStr = chalk.dim(r.label.padEnd(labelW));
+      lines.push(`  ${bar}  ${labelStr}${r.value}`);
+    }
+  }
+
+  // Footer
+  if (opts.sig || opts.url || opts.latencyMs !== undefined) {
+    lines.push(`  ${bar}`);
+    const footerParts: string[] = [];
+    if (opts.sig) footerParts.push(`${DIAMOND}  ${chalk.dim(opts.sig)}`);
+    if (opts.latencyMs !== undefined) footerParts.push(latencyPill(opts.latencyMs));
+    if (footerParts.length > 0) {
+      lines.push(`  ${bar}  ${footerParts.join('   ')}`);
+    }
+    if (opts.url) {
+      lines.push(`  ${bar}     ${chalk.dim(compactUrl(opts.url, INNER - 6))}`);
+    }
+  }
+
+  lines.push('');
+  return lines.join('\n');
+}
+
+/**
+ * Welcome banner — tight, branded, two lines.
+ *
+ *   ◆  MAGIC TRADING  v2                  Flash · MagicBlock ER · sub-second
+ *   ────────────────────────────────────────────────────────────────────────
+ */
+export function magicBanner(): string {
+  const left = `${DIAMOND}  ${chalk.cyan.bold('MAGIC TRADING')}  ${chalk.dim('v2')}`;
+  const right = chalk.dim('Flash · MagicBlock ER · sub-second confirms');
+  const padBetween = INNER - vlen(left) - vlen(right);
+  return [
+    '',
+    `  ${left}${' '.repeat(Math.max(padBetween, 4))}${right}`,
+    `  ${chalk.dim('━'.repeat(INNER + 4))}`,
+    '',
+  ].join('\n');
+}
+
+/** A clean two-column key/value block (no card frame). For status screens. */
+export function kvBlock(rows: KV[]): string {
+  const labelW = 16;
+  return rows.map((r) => `  ${chalk.dim(r.label.padEnd(labelW))}${r.value}`).join('\n');
+}
+
+/** Section divider with optional title — used between groups in dashboard. */
+export function divider(title?: string): string {
+  if (!title) return chalk.dim('  ' + '─'.repeat(INNER));
+  const padded = ` ${title.toUpperCase()} `;
+  const remaining = INNER - vlen(padded);
+  return `  ${chalk.dim('─'.repeat(2))}${chalk.cyan.bold(padded)}${chalk.dim('─'.repeat(Math.max(remaining - 2, 1)))}`;
+}
+
+/** Map a 0–1 distance-to-liq into a colored progress segment. Used in watch. */
+export function liqDistanceBar(distance: number, width = 12): string {
+  // Higher distance = safer = greener bar fully filled green.
+  // Lower distance = more red.
+  const ratio = Math.max(0, Math.min(1, distance));
+  const filled = Math.round(ratio * width);
+  let color = chalk.green;
+  if (ratio < 0.15) color = chalk.red;
+  else if (ratio < 0.30) color = chalk.yellow;
+  return color('█'.repeat(filled)) + chalk.dim('·'.repeat(width - filled));
+}
+
+/** @deprecated kept for back-compat only. */
+export function gradient(text: string): string {
+  return chalk.cyan.bold(text);
 }

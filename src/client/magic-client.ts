@@ -150,15 +150,30 @@ export class MagicTradeClient implements IFlashClient {
   } | null = null;
 
   /**
-   * Pre-warmed ER blockhash. Refreshed every 400ms in the background so trade
+   * Pre-warmed ER blockhash. Refreshed every 250ms in the background so trade
    * ixs can skip the RPC roundtrip (~30-80ms per tx) for `getLatestBlockhash`.
    * The SDK's `sendErTransactionLegacy` calls `conn.getLatestBlockhash()` —
    * we monkey-patch it on the ER connection so the cached value is returned.
+   *
+   * Tightened from 400ms → 250ms to keep the cache fresher for high-frequency
+   * trading. ER block time is ~400ms; cache lives less than one block so we
+   * never hand out a stale-by-default value.
    */
   private blockhashCache: { blockhash: string; lastValidBlockHeight: number; fetchedAt: number } | null = null;
   private blockhashTimer: ReturnType<typeof setInterval> | null = null;
-  private static readonly BLOCKHASH_REFRESH_MS = 400;
-  private static readonly BLOCKHASH_MAX_AGE_MS = 1000;
+  private static readonly BLOCKHASH_REFRESH_MS = 250;
+  private static readonly BLOCKHASH_MAX_AGE_MS = 800;
+
+  /**
+   * Cached oracle prices per symbol — populated by background pre-warmer for
+   * markets the user has interacted with. Saves the per-trade `fetchEntryPrice`
+   * simulate (~100ms) on follow-up trades for the same symbol.
+   */
+  private oracleCache = new Map<string, { price: number; fetchedAt: number }>();
+  private oracleWatchSet = new Set<string>();
+  private oracleTimer: ReturnType<typeof setInterval> | null = null;
+  private static readonly ORACLE_REFRESH_MS = 1000;
+  private static readonly ORACLE_MAX_AGE_MS = 3000;
 
   /** Per-market mutex (key: `MARKET:SIDE`). */
   private readonly activeTrades = new Set<string>();
@@ -240,6 +255,53 @@ export class MagicTradeClient implements IFlashClient {
       clearInterval(this.blockhashTimer);
       this.blockhashTimer = null;
     }
+    if (this.oracleTimer) {
+      clearInterval(this.oracleTimer);
+      this.oracleTimer = null;
+    }
+  }
+
+  /**
+   * Mark a symbol for background oracle pre-warming. After the first trade or
+   * `magic price <sym>` call we keep the price hot via a 1s background loop,
+   * so subsequent opens skip the ~100ms simulate entirely.
+   */
+  watchOraclePrice(symbol: string): void {
+    if (this.oracleWatchSet.has(symbol)) return;
+    this.oracleWatchSet.add(symbol);
+    this.installOracleWarmer();
+  }
+
+  /** Read a cached oracle price if fresh, else null (caller fetches live). */
+  cachedOraclePrice(symbol: string): number | null {
+    const c = this.oracleCache.get(symbol);
+    if (!c) return null;
+    if (Date.now() - c.fetchedAt > MagicTradeClient.ORACLE_MAX_AGE_MS) return null;
+    return c.price;
+  }
+
+  private installOracleWarmer(): void {
+    if (this.oracleTimer) return;
+    const tick = async (): Promise<void> => {
+      const symbols = Array.from(this.oracleWatchSet);
+      if (symbols.length === 0) return;
+      // Parallel — each fetchOraclePrice is one ER simulate.
+      await Promise.all(
+        symbols.map(async (s) => {
+          try {
+            const price = await this.fetchOraclePrice(s);
+            if (Number.isFinite(price) && price > 0) {
+              this.oracleCache.set(s, { price, fetchedAt: Date.now() });
+            }
+          } catch {
+            /* skip */
+          }
+        }),
+      );
+    };
+    void tick();
+    this.oracleTimer = setInterval(() => void tick(), MagicTradeClient.ORACLE_REFRESH_MS);
+    this.oracleTimer.unref?.();
   }
 
   // ─── IFlashClient: reads ───────────────────────────────────────────────────
@@ -489,6 +551,10 @@ export class MagicTradeClient implements IFlashClient {
       });
       throw new Error(rate.reason);
     }
+
+    // Hot-path optimization: mark this market for background oracle pre-warming
+    // so the next trade in the same market skips the ~100ms simulate.
+    this.watchOraclePrice(targetSymbol);
 
     const lockKey = `${targetSymbol}:${side}`;
     this.acquireTradeLock(lockKey);
