@@ -93,7 +93,19 @@ function formatAnchorError(err: unknown): string {
   return base;
 }
 
-/** Lazy client builder — defers ER connection until first magic command. */
+/**
+ * Cached MagicTradeClient per (network, pool, wallet, erEndpoint) tuple.
+ *
+ * Why cache: every magic command was rebuilding the client from scratch,
+ * losing the warmed blockhash, oracle cache, quote cache, and validated
+ * program-set hash. Caching keeps these warm across commands → second
+ * trade in same session is significantly faster.
+ *
+ * When wallet/network/pool/endpoint changes, the old client is shut down
+ * (timers cleared) and replaced — no leaks.
+ */
+const _magicClientCache = new Map<string, MagicTradeClient>();
+
 function buildMagicClient(context: ToolContext): MagicTradeClient {
   const kp = context.walletManager.getKeypair();
   if (!kp) {
@@ -105,11 +117,28 @@ function buildMagicClient(context: ToolContext): MagicTradeClient {
   const network = context.config?.magicNetwork ?? 'mainnet-beta';
   const poolName = context.config?.magicPoolName ?? (network === 'mainnet-beta' ? 'Pool.0' : 'Pool.1');
   const erEndpoint = context.config?.magicRpcUrl ?? 'https://flashtrade.magicblock.app/';
+  const cacheKey = `${network}:${poolName}:${kp.publicKey.toBase58()}:${erEndpoint}`;
+
+  const cached = _magicClientCache.get(cacheKey);
+  if (cached) return cached;
+
+  // Tear down stale clients (different wallet/network/pool/endpoint) so their
+  // background timers don't leak.
+  for (const [k, c] of _magicClientCache) {
+    if (k === cacheKey) continue;
+    try {
+      c.shutdown();
+    } catch {
+      /* best-effort */
+    }
+    _magicClientCache.delete(k);
+  }
+
   const l1Url =
     context.config?.magicL1RpcUrl ??
     (network === 'mainnet-beta' ? 'https://api.mainnet-beta.solana.com' : 'https://api.devnet.solana.com');
   const l1Connection = new Connection(l1Url, 'confirmed');
-  return new MagicTradeClient({
+  const client = new MagicTradeClient({
     wallet: kp,
     l1Connection,
     network,
@@ -119,6 +148,20 @@ function buildMagicClient(context: ToolContext): MagicTradeClient {
     prioritizationFee: context.config?.computeUnitPrice,
     fastConfirm: context.config?.magicFastConfirm ?? true,
   });
+  _magicClientCache.set(cacheKey, client);
+  return client;
+}
+
+/** Tear down all cached clients — used by tests + shutdown path. */
+export function shutdownMagicClients(): void {
+  for (const c of _magicClientCache.values()) {
+    try {
+      c.shutdown();
+    } catch {
+      /* best-effort */
+    }
+  }
+  _magicClientCache.clear();
 }
 
 export const magicInspect: ToolDefinition = {
