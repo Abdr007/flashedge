@@ -1,3 +1,6 @@
+/* eslint-disable max-lines -- magic-mode tool definitions live here as a
+   single file for ToolDefinition co-location; splitting per-tool would
+   scatter shared helpers (build client, format helpers, journaling). */
 /**
  * Magic-mode CLI tools — bound to the new SDK-backed MagicTradeClient.
  *
@@ -301,19 +304,103 @@ export const magicVerify: ToolDefinition = {
   },
 };
 
+/** Infer category from a custody's pyth ticker (Crypto.SOL/USD, FX.EUR/USD, etc.). */
+function categoryOf(pythTicker?: string): 'Crypto' | 'Equity' | 'FX' | 'Metal' | 'Commodity' | 'Other' {
+  if (!pythTicker) return 'Other';
+  if (pythTicker.startsWith('Crypto.')) return 'Crypto';
+  if (pythTicker.startsWith('Equity.')) return 'Equity';
+  if (pythTicker.startsWith('FX.')) return 'FX';
+  if (pythTicker.startsWith('Metal.')) return 'Metal';
+  if (pythTicker.startsWith('Commodities.')) return 'Commodity';
+  return 'Other';
+}
+
 export const magicMarkets: ToolDefinition = {
   name: 'magicMarkets',
-  description: 'List all markets in the active Magic Trade pool with leverage caps.',
-  async execute(_params, context): Promise<ToolResult> {
+  description: 'List all markets in the active Magic Trade pool grouped by category, with leverage caps.',
+  parameters: z.object({ category: z.string().optional(), filter: z.string().optional() }),
+  async execute(params, context): Promise<ToolResult> {
     const client = buildMagicClient(context);
-    const markets = client.listMarkets();
-    const lines = markets.length
-      ? markets.map((m) => `  ${m.symbol.padEnd(10)} ${m.side.padEnd(5)}  maxLev=${m.maxLev.toString().padStart(4)}x  ${m.pubkey.slice(0, 8)}…`)
-      : ['(no markets in active pool)'];
+    const filterCat = (params.category as string | undefined)?.toLowerCase();
+    const filterSym = (params.filter as string | undefined)?.toUpperCase();
+    const pool = client.poolConfig;
+
+    // Build per-symbol summary: side(s) available, maxLev, degenMaxLev, lock, category.
+    type Row = {
+      symbol: string;
+      pair: string;
+      category: ReturnType<typeof categoryOf>;
+      sides: { side: 'long' | 'short'; lockSymbol: string; maxLev: number; degenMaxLev: number; pubkey: string }[];
+    };
+    const bySym = new Map<string, Row>();
+    for (const m of pool.markets) {
+      const target = pool.custodies.find((c) => c.custodyAccount.equals(m.targetCustody));
+      const lock = pool.custodies.find((c) => c.custodyAccount.equals(m.collateralCustody));
+      if (!target) continue;
+      if (filterSym && target.symbol !== filterSym) continue;
+      const tok = pool.tokens.find((t) => t.symbol === target.symbol);
+      const cat = categoryOf(tok?.pythTicker);
+      if (filterCat && cat.toLowerCase() !== filterCat) continue;
+      let row = bySym.get(target.symbol);
+      if (!row) {
+        const pair = (tok?.pythTicker?.split('.').pop() ?? `${target.symbol}/USD`).replace(/\/USD$/, '/USD');
+        row = { symbol: target.symbol, pair, category: cat, sides: [] };
+        bySym.set(target.symbol, row);
+      }
+      const sideStr = (typeof m.side === 'string' ? m.side : Object.keys(m.side as object)[0]) as 'long' | 'short';
+      row.sides.push({
+        side: sideStr,
+        lockSymbol: lock?.symbol ?? '?',
+        maxLev: m.maxLev,
+        degenMaxLev: m.degenMaxLev,
+        pubkey: m.marketAccount.toBase58(),
+      });
+    }
+
+    // Group by category, render as a single tight table.
+    const CATS: ReturnType<typeof categoryOf>[] = ['Crypto', 'Equity', 'FX', 'Metal', 'Commodity', 'Other'];
+    const out: string[] = [
+      '',
+      `  ${chalk.cyan.bold(`MARKETS`)}  ${chalk.dim(`${bySym.size} symbols · ${Array.from(bySym.values()).reduce((n, r) => n + r.sides.length, 0)} markets · pool ${pool.poolName}`)}`,
+      `  ${chalk.dim('─'.repeat(74))}`,
+    ];
+    for (const cat of CATS) {
+      const rows = Array.from(bySym.values()).filter((r) => r.category === cat);
+      if (rows.length === 0) continue;
+      out.push('');
+      out.push(`  ${chalk.cyan(cat.toUpperCase())}  ${chalk.dim(`(${rows.length})`)}`);
+      out.push(
+        '    ' +
+          chalk.dim('Symbol'.padEnd(8)) +
+          chalk.dim('Pair'.padEnd(14)) +
+          chalk.dim('L lock'.padEnd(8)) +
+          chalk.dim('S lock'.padEnd(8)) +
+          chalk.dim('Max'.padEnd(8)) +
+          chalk.dim('Degen'.padEnd(8)),
+      );
+      for (const r of rows.sort((a, b) => a.symbol.localeCompare(b.symbol))) {
+        const longSide = r.sides.find((s) => s.side === 'long');
+        const shortSide = r.sides.find((s) => s.side === 'short');
+        const maxLev = Math.max(longSide?.maxLev ?? 0, shortSide?.maxLev ?? 0);
+        const degenLev = Math.max(longSide?.degenMaxLev ?? 0, shortSide?.degenMaxLev ?? 0);
+        out.push(
+          '    ' +
+            chalk.bold(r.symbol.padEnd(8)) +
+            chalk.dim(r.pair.padEnd(14)) +
+            (longSide?.lockSymbol ?? '-').padEnd(8) +
+            (shortSide?.lockSymbol ?? '-').padEnd(8) +
+            chalk.green(`${maxLev}x`.padEnd(8)) +
+            chalk.yellow(`${degenLev}x`.padEnd(8)),
+        );
+      }
+    }
+    out.push('');
+    out.push(chalk.dim('  Filter: `magic markets crypto`, `magic markets fx`, `magic markets sol`'));
+    out.push('');
     return {
       success: true,
-      message: lines.join('\n'),
-      data: { marketCount: markets.length, rawMarkets: markets },
+      message: out.join('\n'),
+      data: { count: bySym.size, totalMarkets: Array.from(bySym.values()).reduce((n, r) => n + r.sides.length, 0) },
     };
   },
 };

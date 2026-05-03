@@ -2446,8 +2446,16 @@ export class FlashTerminal {
             if (parts.length < 2) return { error: 'usage: magic price <symbol>' };
             return { tool: 'magicPrice', params: { market: parts[1] } };
           }
-          case 'markets':
-            return { tool: 'magicMarkets', params: {} };
+          case 'markets': {
+            // Optional filter: `magic markets crypto`, `magic markets fx`, `magic markets sol`
+            const arg = parts[1];
+            if (!arg) return { tool: 'magicMarkets', params: {} };
+            const knownCategories = new Set(['crypto', 'equity', 'fx', 'metal', 'commodity']);
+            if (knownCategories.has(arg.toLowerCase())) {
+              return { tool: 'magicMarkets', params: { category: arg.toLowerCase() } };
+            }
+            return { tool: 'magicMarkets', params: { filter: arg.toUpperCase() } };
+          }
           case 'delegation':
           case 'delegated':
             return { tool: 'magicDelegation', params: {} };
