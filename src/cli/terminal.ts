@@ -2368,15 +2368,37 @@ export class FlashTerminal {
       'price', 'markets', 'status', 'inspect', 'delegation', 'delegated',
       'setup', 'faucet',
     ]);
+    // Typo tolerance for the literal 'magic' prefix — "msgic vault" / "magc vault"
+    // are Levenshtein 1 from "magic", suggest the fix without dispatching.
+    const TYPO_NEAR_MAGIC = new Set(['msgic', 'magc', 'macig', 'maigc', 'mgaic', 'amgic']);
+    const firstWordTypoCheck = lower.split(/\s+/)[0] ?? '';
+    if (TYPO_NEAR_MAGIC.has(firstWordTypoCheck)) {
+      console.log('');
+      console.log(chalk.yellow(`  Did you mean ${chalk.cyan('magic')}? (typed: "${firstWordTypoCheck}")`));
+      console.log(chalk.dim(`  Try: magic ${input.trim().split(/\s+/).slice(1).join(' ')}`));
+      console.log('');
+      return;
+    }
+
     // Compute the effective input/lower with magic prefix when needed.
     // Avoid recursion (would re-hit the backpressure throttle); just prepend
     // 'magic ' locally and let the magic dispatcher block handle it.
     const firstWord = lower.split(/\s+/)[0] ?? '';
+    // V1-style trade verbs (`long SOL 2x $10`, `short BTC 5x $20`) — when in
+    // magic mode, route them through `magic open` so they hit the magic
+    // dispatcher's flexible parser instead of falling through to live/sim.
+    const MAGIC_TRADE_VERBS = new Set(['long', 'short', 'buy', 'sell']);
     let effInput = input;
     let effLower = lower;
-    if (this.config.tradingMode === 'magic' && MAGIC_VERBS.has(firstWord) && !lower.startsWith('magic ')) {
-      effInput = `magic ${input.trim()}`;
-      effLower = `magic ${lower}`;
+    if (this.config.tradingMode === 'magic' && !lower.startsWith('magic ')) {
+      if (MAGIC_VERBS.has(firstWord)) {
+        effInput = `magic ${input.trim()}`;
+        effLower = `magic ${lower}`;
+      } else if (MAGIC_TRADE_VERBS.has(firstWord)) {
+        // `long BTC 2x 10` → `magic open long BTC 2x 10`
+        effInput = `magic open ${input.trim()}`;
+        effLower = `magic open ${lower}`;
+      }
     }
 
     if (effLower === 'magic' || effLower.startsWith('magic ')) {
@@ -3293,6 +3315,27 @@ export class FlashTerminal {
       }
       this.restoreWallet(walletRestoreData);
       return;
+    }
+
+    // ─── Magic-mode failsafe ─────────────────────────────────────────
+    // In MAGIC mode, refuse to dispatch live/sim trade tools. Redirect users
+    // to the magic equivalent. Prevents the SIM_xxx fallback when a v1-style
+    // command escapes the auto-prefix.
+    if (this.config.tradingMode === 'magic') {
+      const blockedActions = [
+        ActionType.OpenPosition,
+        ActionType.ClosePosition,
+        ActionType.AddCollateral,
+        ActionType.RemoveCollateral,
+      ];
+      if (blockedActions.includes(intent.action as ActionType)) {
+        console.log('');
+        console.log(chalk.yellow('  In MAGIC mode — use magic commands for trades:'));
+        console.log(chalk.dim('    open SOL long 10 2     close SOL long     add SOL long 5'));
+        console.log(chalk.dim('    Auto-prefix is on; you can also write `magic open …`.'));
+        console.log('');
+        return;
+      }
     }
 
     // Execute tool — no animated ticker (conflicts with sendTx progress output)
