@@ -1560,23 +1560,30 @@ export class MagicTradeClient implements IFlashClient {
   }
 
   /**
-   * For pools where the lock custody isn't always USDC (correlated markets),
-   * resolve the lockSymbol from PoolConfig. Most mainnet markets lock against
-   * USDC; some (like SOL/BTC native-collateral variants) lock against the
-   * target token itself.
+   * Resolve `(targetSymbol, side)` → `{ lockSymbol, market }` by reading the
+   * actual lock custody from PoolConfig.markets directly. Pool.0 has three
+   * lock conventions:
+   *   - Long with target lock:    SOL/BTC/ETH/HYPE/SPY/ZEC long
+   *   - Long with BTC lock:       BNB/MON/SUI long (cross-asset coverage)
+   *   - Long/Short with USDC lock: stables / FX / metals / equities / commodities
+   * We just iterate the markets array and find the one matching (target, side),
+   * then read .collateralCustody to get the lock symbol. Handles any future
+   * pool config without code changes.
    */
   private resolveMarket(targetSymbol: string, side: TradeSide): { lockSymbol: string; market: MarketConfig } {
     const target = this.poolConfig.getCustodyFromSymbol(targetSymbol);
-    const sdkSide = side === 'long' ? Side.Long : Side.Short;
-    // Prefer the USDC-lock market if one exists for this target+side.
-    const usdc = this.poolConfig.custodies.find((c) => c.symbol === 'USDC');
-    if (usdc) {
-      const usdcMarket = this.poolConfig.getMarketConfig(target.custodyAccount, usdc.custodyAccount, sdkSide);
-      if (usdcMarket) return { lockSymbol: 'USDC', market: usdcMarket };
+    if (!target) {
+      throw new Error(`[magic-mode] unknown market symbol '${targetSymbol}'. Run \`magic markets\` to see available.`);
     }
-    // Fall back to native-collateral market.
-    const nativeMarket = this.poolConfig.getMarketConfig(target.custodyAccount, target.custodyAccount, sdkSide);
-    if (nativeMarket) return { lockSymbol: targetSymbol, market: nativeMarket };
+    const wantSide = side === TradeSide.Long ? 'long' : 'short';
+    for (const m of this.poolConfig.markets) {
+      if (!m.targetCustody.equals(target.custodyAccount)) continue;
+      const mSide = (typeof m.side === 'string' ? m.side : Object.keys(m.side as object)[0]) as 'long' | 'short';
+      if (mSide !== wantSide) continue;
+      const lockCustody = this.poolConfig.custodies.find((c) => c.custodyAccount.equals(m.collateralCustody));
+      if (!lockCustody) continue;
+      return { lockSymbol: lockCustody.symbol, market: m };
+    }
     throw new Error(`[magic-mode] no market for ${targetSymbol} ${side} in pool ${this.poolConfig.poolName}`);
   }
 
