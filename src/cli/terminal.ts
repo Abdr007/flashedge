@@ -1355,6 +1355,34 @@ export class FlashTerminal {
         console.log(`  ${chalk.red('[ DEVNET ]')}  ${chalk.dim('— testnet pool, free SOL faucet')}`);
         console.log('');
       }
+      // Pre-warm: build the MagicTradeClient now so the first trade skips
+      // the cold-start cost (TLS handshakes to L1 + ER, Anchor program
+      // init, blockhash warmer kickoff, oracle fetch for SOL). Runs in the
+      // background while the user reads the Quick Start; failure is silent
+      // (first command will just rebuild).
+      void (async () => {
+        try {
+          const { prewarmMagicClient } = await import('../tools/magic-tools.js');
+          const kp = this.walletManager?.getKeypair();
+          if (!kp) return;
+          const network = (this.config.magicNetwork ?? 'mainnet-beta') as 'mainnet-beta' | 'devnet';
+          const poolName = this.config.magicPoolName ?? (network === 'mainnet-beta' ? 'Pool.0' : 'Pool.1');
+          const erEndpoint = this.config.magicRpcUrl ?? 'https://flashtrade.magicblock.app/';
+          const l1Url = this.config.magicL1RpcUrl ?? (network === 'mainnet-beta' ? 'https://api.mainnet-beta.solana.com' : 'https://api.devnet.solana.com');
+          prewarmMagicClient({
+            walletKeypair: kp,
+            network,
+            poolName,
+            erEndpoint,
+            l1Url,
+            programIdOverride: this.config.magicProgramId,
+            prioritizationFee: this.config.computeUnitPrice,
+            fastConfirm: this.config.magicFastConfirm ?? true,
+          });
+        } catch {
+          /* first command will rebuild */
+        }
+      })();
     } else {
       console.log(`  ${theme.accentBold('FLASH TERMINAL')}`);
       console.log(`  ${theme.separator(32)}`);
@@ -2874,6 +2902,32 @@ export class FlashTerminal {
       try {
         const result = await this.engine.executeTool(resolved.tool!, resolved.params!);
         console.log(result.message);
+
+        // Track the action for session stats + render the live footer below
+        // the card so the CLI feels alive between commands.
+        const ACTION_TYPE: Record<string, 'open' | 'close' | 'add' | 'remove' | 'tp' | 'sl' | 'limit' | 'reverse' | 'increase' | 'decrease' | 'liquidate' | 'settle' | 'deposit' | 'withdraw'> = {
+          magicOpen: 'open',
+          magicClose: 'close',
+          magicAddCollateral: 'add',
+          magicRemoveCollateral: 'remove',
+          magicTriggerOrder: 'tp',
+          magicPlaceLimit: 'limit',
+          magicReverse: 'reverse',
+          magicIncrease: 'increase',
+          magicPartialClose: 'decrease',
+          magicLiquidate: 'liquidate',
+          magicSettle: 'settle',
+          magicDeposit: 'deposit',
+          magicWithdraw: 'withdraw',
+        };
+        const actionType = ACTION_TYPE[resolved.tool!];
+        if (actionType) {
+          const { recordMagicAction, renderSessionFooter } = await import('./magic-session-stats.js');
+          // Pull pnl from close cards if available
+          const data = result.data as { result?: { pnl?: number } } | undefined;
+          recordMagicAction({ type: actionType, pnlUsd: data?.result?.pnl });
+          console.log(renderSessionFooter());
+        }
       } catch (err) {
         console.log(chalk.red(`  magic error: ${(err as Error).message}`));
       }

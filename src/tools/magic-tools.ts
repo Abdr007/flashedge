@@ -152,6 +152,41 @@ function buildMagicClient(context: ToolContext): MagicTradeClient {
   return client;
 }
 
+/**
+ * Pre-build and cache a MagicTradeClient at terminal startup so the first
+ * trade doesn't pay the cold-start cost (TLS handshakes, Anchor init, oracle
+ * fetch). Idempotent — safe to call multiple times. Returns the cached client.
+ */
+export function prewarmMagicClient(opts: {
+  walletKeypair: import('@solana/web3.js').Keypair;
+  network: 'mainnet-beta' | 'devnet';
+  poolName: string;
+  erEndpoint: string;
+  l1Url: string;
+  programIdOverride?: string;
+  prioritizationFee?: number;
+  fastConfirm?: boolean;
+}): MagicTradeClient {
+  const cacheKey = `${opts.network}:${opts.poolName}:${opts.walletKeypair.publicKey.toBase58()}:${opts.erEndpoint}`;
+  const existing = _magicClientCache.get(cacheKey);
+  if (existing) return existing;
+  const client = new MagicTradeClient({
+    wallet: opts.walletKeypair,
+    l1Connection: new Connection(opts.l1Url, 'confirmed'),
+    network: opts.network,
+    poolName: opts.poolName,
+    erEndpoint: opts.erEndpoint,
+    programIdOverride: opts.programIdOverride,
+    prioritizationFee: opts.prioritizationFee,
+    fastConfirm: opts.fastConfirm ?? true,
+  });
+  _magicClientCache.set(cacheKey, client);
+  // Kick off an oracle pre-fetch for SOL — most-traded symbol, primes the
+  // background warmer so the first quote is a cache hit.
+  client.fetchOraclePrice('SOL').catch(() => undefined);
+  return client;
+}
+
 /** Tear down all cached clients — used by tests + shutdown path. */
 export function shutdownMagicClients(): void {
   for (const c of _magicClientCache.values()) {
