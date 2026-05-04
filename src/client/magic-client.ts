@@ -161,8 +161,11 @@ export class MagicTradeClient implements IFlashClient {
    */
   private blockhashCache: { blockhash: string; lastValidBlockHeight: number; fetchedAt: number } | null = null;
   private blockhashTimer: ReturnType<typeof setInterval> | null = null;
-  private static readonly BLOCKHASH_REFRESH_MS = 250;
-  private static readonly BLOCKHASH_MAX_AGE_MS = 800;
+  // ER block time is ~400ms. Refresh aggressively (200ms) and only serve
+  // cached hashes that are ≤ 500ms old — anything older risks the validator
+  // having advanced past it and rejecting with "Blockhash not found".
+  private static readonly BLOCKHASH_REFRESH_MS = 200;
+  private static readonly BLOCKHASH_MAX_AGE_MS = 500;
 
   /**
    * Cached oracle prices per symbol — populated by background pre-warmer for
@@ -1414,21 +1417,44 @@ export class MagicTradeClient implements IFlashClient {
       if ((s as Keypair).secretKey) signers.push(s as Keypair);
     }
 
+    // Auto-retry on stale blockhash. The cached blockhash can be older than the
+    // ER's accepted window; on rejection we evict the cache and try once more
+    // with a fresh fetch. Two attempts max so a real failure surfaces quickly.
+    const isStaleBlockhash = (err: unknown): boolean => {
+      const msg = (err as { message?: string }).message ?? '';
+      return /blockhash not found/i.test(msg);
+    };
+
     if (this.fastConfirm) {
-      // Submit-and-return: ~30-50ms perceived latency. Background poll surfaces
-      // any failure asynchronously via the logger (and signing-guard audit log).
-      const sig = await this.sdk.sendErTransaction(ixs, signers, {
-        skipConfirm: true,
-      });
-      this.pollErTxBackground(sig, context);
-      return sig;
+      try {
+        const sig = await this.sdk.sendErTransaction(ixs, signers, { skipConfirm: true });
+        this.pollErTxBackground(sig, context);
+        return sig;
+      } catch (err) {
+        if (!isStaleBlockhash(err)) throw err;
+        log.warn('magic-client', `${context}: stale blockhash → evicting cache + retry`);
+        this.blockhashCache = null;
+        const sig = await this.sdk.sendErTransaction(ixs, signers, { skipConfirm: true });
+        this.pollErTxBackground(sig, context);
+        return sig;
+      }
     }
 
-    const result = await this.sdk.sendAndConfirmErTransaction(ixs, signers, {
-      pollTimeoutMs: 10_000,
-      pollIntervalMs: 500,
-    });
-    return result.signature;
+    try {
+      const result = await this.sdk.sendAndConfirmErTransaction(ixs, signers, {
+        pollTimeoutMs: 10_000,
+        pollIntervalMs: 500,
+      });
+      return result.signature;
+    } catch (err) {
+      if (!isStaleBlockhash(err)) throw err;
+      this.blockhashCache = null;
+      const result = await this.sdk.sendAndConfirmErTransaction(ixs, signers, {
+        pollTimeoutMs: 10_000,
+        pollIntervalMs: 500,
+      });
+      return result.signature;
+    }
   }
 
   /**

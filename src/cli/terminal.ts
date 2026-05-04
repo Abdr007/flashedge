@@ -5,6 +5,7 @@ import { homedir } from 'os';
 import { join } from 'path';
 import chalk from 'chalk';
 import { OfflineInterpreter, localParse } from '../ai/interpreter.js';
+import { PoolConfig as MagicSDK_PoolConfig } from '@flash_trade/magic-trade-client';
 import { ToolEngine } from '../tools/engine.js';
 import {
   ToolContext,
@@ -203,12 +204,10 @@ function getMagicSymbolSet(network: string, pool: string): { symbols: Set<string
   const symbols = new Set<string>();
   const aliases = new Map<string, string>();
   try {
-    // Lazy-import the SDK so the parser works without forcing the SDK on
-    // non-magic users at import time.
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { PoolConfig } = require('@flash_trade/magic-trade-client') as { PoolConfig: { fromIdsByName: (n: string, c: 'mainnet-beta' | 'devnet') => { custodies: Array<{ symbol: string }> } } };
+    // ESM-safe access — the SDK is statically imported at the top of this file
+    // (createRequire-style require() doesn't work in NodeNext/ESM here).
     const cluster = network === 'devnet' ? 'devnet' : 'mainnet-beta';
-    const p = PoolConfig.fromIdsByName(pool, cluster);
+    const p = MagicSDK_PoolConfig.fromIdsByName(pool, cluster);
     for (const c of p.custodies) symbols.add(c.symbol.toUpperCase());
   } catch {
     /* fall through with empty set; live-mode parser will still try */
