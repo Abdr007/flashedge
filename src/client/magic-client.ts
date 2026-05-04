@@ -227,16 +227,29 @@ export class MagicTradeClient implements IFlashClient {
       preflightCommitment: 'confirmed',
     });
 
-    this.sdk = new MagicTradePerpetualsClient(
-      provider,
-      MAGIC_TRADE_IDL,
-      this.programId,
-      {
-        prioritizationFee: opts.prioritizationFee ?? 0,
-        useExternalOracle: false,
-      },
-      opts.erEndpoint,
-    );
+    // SDK's MagicTradePerpetualsClient.initEr() prints a raw `console.log`
+    // banner. That intrudes into our terminal output (esp. background
+    // pre-warm). Silence it surgically during construction.
+    const origLog = console.log;
+    console.log = (...args: unknown[]) => {
+      const first = args[0];
+      if (typeof first === 'string' && first.startsWith('[MagicTrade]')) return;
+      return origLog(...args);
+    };
+    try {
+      this.sdk = new MagicTradePerpetualsClient(
+        provider,
+        MAGIC_TRADE_IDL,
+        this.programId,
+        {
+          prioritizationFee: opts.prioritizationFee ?? 0,
+          useExternalOracle: false,
+        },
+        opts.erEndpoint,
+      );
+    } finally {
+      console.log = origLog;
+    }
 
     const owner = this.wallet.publicKey;
     this.basketPda = PublicKey.findProgramAddressSync(

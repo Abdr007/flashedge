@@ -1359,8 +1359,9 @@ export class FlashTerminal {
       // Pre-warm: build the MagicTradeClient now so the first trade skips
       // the cold-start cost (TLS handshakes to L1 + ER, Anchor program
       // init, blockhash warmer kickoff, oracle fetch for SOL). Runs in the
-      // background while the user reads the Quick Start; failure is silent
-      // (first command will just rebuild).
+      // background while the user reads the Quick Start; failure is silent.
+      // After completion, redraw the prompt so any output that landed
+      // during prewarm doesn't leave the cursor stranded.
       void (async () => {
         try {
           const { prewarmMagicClient } = await import('../tools/magic-tools.js');
@@ -1382,6 +1383,14 @@ export class FlashTerminal {
           });
         } catch {
           /* first command will rebuild */
+        } finally {
+          // Redraw the prompt — preserveCursor=true keeps any text the
+          // user has already typed visible.
+          try {
+            this.rl?.prompt(true);
+          } catch {
+            /* readline may not be active yet */
+          }
         }
       })();
     } else {
