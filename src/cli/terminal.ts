@@ -6,6 +6,7 @@ import { join } from 'path';
 import chalk from 'chalk';
 import { OfflineInterpreter, localParse } from '../ai/interpreter.js';
 import { PoolConfig as MagicSDK_PoolConfig } from '@flash_trade/magic-trade-client';
+import { latencyPill as magicLatencyPill } from './magic-theme.js';
 import { ToolEngine } from '../tools/engine.js';
 import {
   ToolContext,
@@ -2903,8 +2904,8 @@ export class FlashTerminal {
         const result = await this.engine.executeTool(resolved.tool!, resolved.params!);
         console.log(result.message);
 
-        // Track the action for session stats + render the live footer below
-        // the card so the CLI feels alive between commands.
+        // Track session stats internally (queryable via `dashboard`) but DO NOT
+        // print a footer below every card — was cryptic and pushed the prompt.
         const ACTION_TYPE: Record<string, 'open' | 'close' | 'add' | 'remove' | 'tp' | 'sl' | 'limit' | 'reverse' | 'increase' | 'decrease' | 'liquidate' | 'settle' | 'deposit' | 'withdraw'> = {
           magicOpen: 'open',
           magicClose: 'close',
@@ -2922,11 +2923,9 @@ export class FlashTerminal {
         };
         const actionType = ACTION_TYPE[resolved.tool!];
         if (actionType) {
-          const { recordMagicAction, renderSessionFooter } = await import('./magic-session-stats.js');
-          // Pull pnl from close cards if available
+          const { recordMagicAction } = await import('./magic-session-stats.js');
           const data = result.data as { result?: { pnl?: number } } | undefined;
           recordMagicAction({ type: actionType, pnlUsd: data?.result?.pnl });
-          console.log(renderSessionFooter());
         }
       } catch (err) {
         console.log(chalk.red(`  magic error: ${(err as Error).message}`));
@@ -3760,10 +3759,10 @@ export class FlashTerminal {
     if (skip.includes(this.lastCommand.toLowerCase())) return;
 
     // Magic-mode latency uses the gradient pill; other modes keep plain.
+    // Synchronous render — async import would land AFTER the prompt
+    // re-renders, breaking the cursor flow.
     if (this.config.tradingMode === 'magic') {
-      void import('./magic-theme.js').then(({ latencyPill }) => {
-        console.log(`  ${latencyPill(this.lastCommandMs)}`);
-      });
+      console.log(`  ${magicLatencyPill(this.lastCommandMs)}`);
       return;
     }
     const ms = this.lastCommandMs;

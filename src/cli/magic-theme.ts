@@ -166,20 +166,18 @@ export function renderCard(opts: CardOpts): string {
     }
   }
 
-  // Footer — sig + latency on one line; URL on its own line below the card
-  // (a copy/paste-safe clickable link, never truncated mid-param).
-  if (opts.sig || opts.latencyMs !== undefined) {
+  // Footer is intentionally minimal — just the latency pill if provided.
+  // The full URL goes on its own line OUTSIDE the card frame so terminals
+  // that parse hyperlinks (iTerm, Kitty, Terminal.app) can make it clickable.
+  // We deliberately skip a `◆ sig` row inside the card — it duplicated the
+  // sig that's already in the URL, just adding clutter.
+  if (opts.latencyMs !== undefined) {
     lines.push(`  ${bar}`);
-    const footerParts: string[] = [];
-    if (opts.sig) footerParts.push(`${DIAMOND}  ${chalk.dim(opts.sig)}`);
-    if (opts.latencyMs !== undefined) footerParts.push(latencyPill(opts.latencyMs));
-    lines.push(`  ${bar}  ${footerParts.join('   ')}`);
+    lines.push(`  ${bar}  ${latencyPill(opts.latencyMs)}`);
   }
 
   lines.push('');
   if (opts.url) {
-    // Print the full URL on its own line outside the card frame so terminal
-    // hyperlink parsers (iTerm, Kitty, modern Terminal.app) make it clickable.
     lines.push(`     ${chalk.cyan('→')} ${chalk.dim(opts.url)}`);
     lines.push('');
   }
